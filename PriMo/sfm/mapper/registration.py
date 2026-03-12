@@ -35,6 +35,11 @@ class MpsfmRegistration(BaseClass):
         "refine_init_prior_pose": True,
         "epipolar_refine_min_matches": 12,
         "epipolar_refine_max_iters": 300,
+        # 增量阶段：使用 inliers 对先验位姿做 pose-only refine（类似 BA 固定3D点）
+        "refine_remaining_prior_pose": True,
+        "prior_pose_refine_min_corrs": 24,
+        "prior_pose_refine_max_iters": 150,
+        "prior_pose_refine_reproj_thresh": 12.0,
         "lifted_debug_log_path": str(Path(__file__).resolve().parents[3] / "lifted_debug_log.txt"),
     }
 
@@ -400,6 +405,149 @@ class MpsfmRegistration(BaseClass):
             candidate_points["posdepth2"].append(posdepth2)
             candidate_points["xyz"].append(out["xyz"])
         return candidate_points
+
+    def _find_2D3D_pairs_with_inlier_mask(self, im_ref_id, imid, image_ref, image, inlier_mask, pair2D3D):
+        """基于给定 inlier_mask 收集 ref->qry 的 2D-3D 对应."""
+        corr = self.correspondences.matches(im_ref_id, imid)
+        if len(corr) == 0:
+            pair2D3D["2d"] = np.zeros((0, 2))
+            pair2D3D["3d"] = np.zeros((0, 3))
+            pair2D3D["lifted"] = np.zeros(0, dtype=bool)
+            pair2D3D["3dids"] = np.zeros(0, dtype=int)
+            return
+
+        if inlier_mask is not None:
+            inlier_mask = np.asarray(inlier_mask, dtype=bool)
+            if len(inlier_mask) != len(corr):
+                min_len = min(len(inlier_mask), len(corr))
+                corr = corr[:min_len]
+                inlier_mask = inlier_mask[:min_len]
+            corr = corr[inlier_mask]
+
+        if len(corr) == 0:
+            pair2D3D["2d"] = np.zeros((0, 2))
+            pair2D3D["3d"] = np.zeros((0, 3))
+            pair2D3D["lifted"] = np.zeros(0, dtype=bool)
+            pair2D3D["3dids"] = np.zeros(0, dtype=int)
+            return
+
+        pts2d_ids_ref, pts2d_ids_qry = corr.T
+        use_3d = np.array([image_ref.points2D[pt].has_point3D() for pt in pts2d_ids_ref], dtype=bool)
+        point3D_ids = np.array(
+            [image_ref.points2D[pt].point3D_id for pt, has_3d in zip(pts2d_ids_ref, use_3d) if has_3d], dtype=int
+        )
+        self._collect_pairs(
+            im_ref_id,
+            image_ref,
+            image,
+            pts2d_ids_ref,
+            pts2d_ids_qry,
+            use_3d,
+            point3D_ids,
+            pair2D3D,
+        )
+
+    @staticmethod
+    def _compose_left_pose_delta(T_cw: pycolmap.Rigid3d, delta):
+        """左乘 se(3) 增量更新绝对位姿."""
+        R0 = T_cw.rotation.matrix()
+        t0 = np.asarray(T_cw.translation, dtype=np.float64)
+        R_upd = Rotation.from_rotvec(delta[:3]).as_matrix()
+        t_upd = delta[3:]
+        R_new = R_upd @ R0
+        t_new = R_upd @ t0 + t_upd
+        return R_new, t_new
+
+    def _refine_prior_pose_with_inliers(self, imid, ref_imids, inlier_masks_map, initial_pose):
+        """使用 inliers 构造 2D-3D 约束，对 prior pose 做 pose-only refine."""
+        if not self.conf.refine_remaining_prior_pose:
+            return initial_pose, False, {}
+
+        image = self.mpsfm_rec.images[imid]
+        camera = self.mpsfm_rec.rec.cameras[image.camera_id]
+
+        pair2D3D = defaultdict(dict)
+        nonempty_refs = 0
+        for ref_id in ref_imids:
+            image_ref = self.mpsfm_rec.images[ref_id]
+            inlier_mask = inlier_masks_map.get(ref_id, None)
+            self._find_2D3D_pairs_with_inlier_mask(ref_id, imid, image_ref, image, inlier_mask, pair2D3D[ref_id])
+            if pair2D3D[ref_id].get("2d", np.zeros((0, 2))).shape[0] > 0:
+                nonempty_refs += 1
+
+        if len(pair2D3D) == 0:
+            return initial_pose, False, {}
+
+        points2D, points3D, _, _, _ = self._process_2D3D_pairs(pair2D3D)
+        min_corrs = int(self.conf.prior_pose_refine_min_corrs)
+        if len(points2D) < min_corrs:
+            return initial_pose, False, {"num_corrs": int(len(points2D)), "required_corrs": min_corrs}
+
+        reproj_thresh = float(self.conf.prior_pose_refine_reproj_thresh)
+
+        def reproj_errors_from_rt(R_mat, t_vec):
+            xyz_cam = (R_mat @ points3D.T).T + t_vec[None]
+            residual = np.full((len(points3D), 2), reproj_thresh * 10.0, dtype=np.float64)
+            valid = xyz_cam[:, 2] > 1e-9
+            if np.any(valid):
+                proj = camera.img_from_cam(xyz_cam[valid])
+                residual[valid] = proj - points2D[valid]
+            return residual, valid
+
+        def residual(delta):
+            R_mat, t_vec = self._compose_left_pose_delta(initial_pose, delta)
+            e2d, _ = reproj_errors_from_rt(R_mat, t_vec)
+            return e2d.reshape(-1)
+
+        e_before, valid_before = reproj_errors_from_rt(initial_pose.rotation.matrix(), np.asarray(initial_pose.translation))
+        err_before = np.linalg.norm(e_before, axis=1)
+        inliers_before = int(np.count_nonzero(valid_before & (err_before <= reproj_thresh)))
+
+        try:
+            result = least_squares(
+                residual,
+                np.zeros(6, dtype=np.float64),
+                method="trf",
+                loss="soft_l1",
+                f_scale=reproj_thresh,
+                max_nfev=int(self.conf.prior_pose_refine_max_iters),
+            )
+        except Exception as exc:
+            self.log(f"[PriorPoseRefine] least_squares failed for imid={imid}: {exc}", level=1)
+            return initial_pose, False, {"error": str(exc), "num_corrs": int(len(points2D))}
+
+        if not result.success:
+            return initial_pose, False, {
+                "status": int(getattr(result, "status", -1)),
+                "message": str(getattr(result, "message", "")),
+                "num_corrs": int(len(points2D)),
+            }
+
+        R_opt, t_opt = self._compose_left_pose_delta(initial_pose, result.x)
+        refined_pose = pycolmap.Rigid3d(pycolmap.Rotation3d(R_opt), t_opt)
+
+        e_after, valid_after = reproj_errors_from_rt(R_opt, t_opt)
+        err_after = np.linalg.norm(e_after, axis=1)
+        inliers_after = int(np.count_nonzero(valid_after & (err_after <= reproj_thresh)))
+
+        rot_delta = R_opt @ initial_pose.rotation.matrix().T
+        rot_diff_deg = float(np.rad2deg(Rotation.from_matrix(rot_delta).magnitude()))
+        trans_diff = float(np.linalg.norm(t_opt - np.asarray(initial_pose.translation)))
+
+        stats = {
+            "stage": "register_next_prior",
+            "imid": int(imid),
+            "num_refs": int(nonempty_refs),
+            "num_corrs": int(len(points2D)),
+            "inliers_before": inliers_before,
+            "inliers_after": inliers_after,
+            "rms_before": float(np.sqrt(np.mean(err_before**2))) if len(err_before) else 0.0,
+            "rms_after": float(np.sqrt(np.mean(err_after**2))) if len(err_after) else 0.0,
+            "rot_diff_deg": rot_diff_deg,
+            "trans_diff": trans_diff,
+            "nfev": int(result.nfev),
+        }
+        return refined_pose, True, stats
 
     def _inlier_mask_for_pair_under_pose(
         self,
@@ -877,6 +1025,39 @@ class MpsfmRegistration(BaseClass):
                     log_stage="register_next",
                 )
                 inlier_masks_map[ref_id] = mask
+
+            # 用 inliers 对当前待注册图像的 prior pose 做一次 pose-only 精调（类似 BA 固定3D点）
+            refined_pose, refined_ok, refine_stats = self._refine_prior_pose_with_inliers(
+                imid, ref_imids, inlier_masks_map, image.cam_from_world
+            )
+            if refined_ok:
+                image.cam_from_world = refined_pose
+                self._write_lifted_debug_log(f"prior_pose_refine_im{imid}", refine_stats)
+                # 位姿更新后，重算 inlier mask，确保后续 DC 使用的是 refined pose 的内点
+                refreshed_masks = {}
+                T_qry_cw = image.cam_from_world
+                for ref_id in ref_imids:
+                    image_ref = self.mpsfm_rec.images[ref_id]
+                    camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
+                    matches_ref_qry = self.correspondences.matches(ref_id, imid)
+                    if len(matches_ref_qry) == 0:
+                        refreshed_masks[ref_id] = np.zeros(0, dtype=bool)
+                        continue
+                    kps_ref = self.mpsfm_rec.keypoints(ref_id)
+                    T_ref_cw = image_ref.cam_from_world
+                    refreshed_masks[ref_id] = self._inlier_mask_for_pair_under_pose(
+                        ref_id,
+                        imid,
+                        T_ref_cw,
+                        T_qry_cw,
+                        camera_ref,
+                        camera_qry,
+                        matches_ref_qry,
+                        kps_ref,
+                        kps_qry,
+                        log_stage="register_next_refined",
+                    )
+                inlier_masks_map = refreshed_masks
 
             # 供 DC 失败时移除“好内点”使用
             self.mpsfm_rec.last_ap_inlier_masks = inlier_masks_map
