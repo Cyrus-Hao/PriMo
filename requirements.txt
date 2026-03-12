@@ -1,0 +1,40 @@
+torch 
+torchvision --index-url https://download.pytorch.org/whl/cu121
+omegaconf
+h5py
+tqdm
+opencv-python-headless
+scipy
+cupy-cuda12x
+
+matplotlib
+cholespy
+plotly
+nbformat
+ipywidgets
+gdown
+
+# -- Extraction --
+# LightGlue
+lightglue @ git+https://github.com/cvg/LightGlue
+
+# Metric3Dv2
+mmcv
+HTML4Vision
+timm
+plyfile
+# Optional: xformers (can cause compatibility issues with PyTorch)
+# xformers
+
+# Sky segmentation
+onnxruntime
+
+# MAST3R
+einops
+
+# DSINE
+geffnet
+
+# Dpro
+-e ./third_party/ml-depth-pro
+

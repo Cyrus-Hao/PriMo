@@ -1,0 +1,20 @@
+dataset:
+  return_types:
+    - "image"
+
+model:
+  name: promptda
+  write_name: promptda
+  return_types:
+    - depth
+    - valid
+
+  # Depth files directory (must be set to your path)
+  depth_png_dir: /abs/path/to/depths
+
+  # If RGB and depth filenames match: xxx.jpg -> xxx.png
+  pattern_depth: "{stem}.png"
+
+  # Extra scale factor for depth values
+  scale: 1
+

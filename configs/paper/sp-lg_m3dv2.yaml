@@ -1,0 +1,8 @@
+reconstruction:
+  image:
+    normals: 
+      flip_consistency: true
+extractors:
+  normals: metric3dv2-nfc
+dataset:
+  resize_max: null

@@ -1,0 +1,10 @@
+dataset:
+    return_types:
+        - "image"
+model:
+    write_name: depthanythingv2-outdoor
+    name: depthanythingv2
+    return_types: 
+        - depth
+    scale: 1
+    mode: outdoor

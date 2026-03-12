@@ -1,0 +1,26 @@
+[project]
+name = "mpsfm"
+version = "0.1.0"
+authors = [{ name = "Zador Pataki", email = "zadorpataki14@gmail.com" }]
+requires-python = ">=3.9"
+
+[tool.setuptools]
+packages = ["mpsfm"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 119
+exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "UP", "B", "SIM", "I"]
+ignore = ["SIM117"]
+
+[tool.black]
+line-length = 119
+exclude = '''
+/third_party
+'''

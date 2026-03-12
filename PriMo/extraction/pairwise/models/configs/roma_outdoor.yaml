@@ -1,0 +1,9 @@
+output: roma_outdoor
+model:
+  name: roma
+type: dense
+preprocessing:
+  dfactor: 14
+  resize: True
+  resize_max: 1024
+resize: null

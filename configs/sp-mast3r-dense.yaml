@@ -1,0 +1,4 @@
+# unique config: uses depth maps direclty extracted by matcher. here we match superpoint features with mast3r
+defaults:
+  - defaults/mast3r # see directory mpsfm/sfm/configs/defaults for more default configs
+matches_mode: sparse+dense+depth

@@ -1,0 +1,11 @@
+
+extractors:
+  depth: metric3dv2-small
+  normals: metric3dv2-small
+reconstruction:
+  image:
+    depth:
+      prior_std_multiplier: 2.045
+      depth_uncertainty: 0.0433
+
+    

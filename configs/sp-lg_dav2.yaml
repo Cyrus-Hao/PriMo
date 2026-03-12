@@ -1,0 +1,3 @@
+#instead of metric3dv2 dpeth, we use depthanythingv2 
+defaults:
+  - defaults/depthanythingv2 # see mpsfm/sfm/configs/defaults/depthanythingv2.yaml

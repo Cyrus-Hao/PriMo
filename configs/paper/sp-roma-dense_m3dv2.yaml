@@ -1,0 +1,12 @@
+extractors:
+  matcher: roma_outdoor
+  normals: metric3dv2-nfc
+matches_mode: sparse+dense
+correspondences:
+  cached_dense_scores: true
+reconstruction:
+  image:
+    normals: 
+      flip_consistency: true
+dataset:
+  resize_max: null

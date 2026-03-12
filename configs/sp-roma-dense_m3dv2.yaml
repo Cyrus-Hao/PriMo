@@ -1,0 +1,4 @@
+# uses defaults, but instead of matching superpoint features with lightlgue, here we use RoMA
+extractors:
+  matcher: roma_outdoor
+matches_mode: sparse+dense # in addition to sparse matches, we sample matches in non-salient regions

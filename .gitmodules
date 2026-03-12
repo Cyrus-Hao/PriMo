@@ -1,0 +1,24 @@
+[submodule "third_party/Metric3D"]
+	path = third_party/Metric3D
+	url = git@github.com:YvanYin/Metric3D.git
+[submodule "third_party/DSINE"]
+	path = third_party/DSINE
+	url = git@github.com:baegwangbin/DSINE.git
+[submodule "third_party/Depth-Anything-V2"]
+	path = third_party/Depth-Anything-V2
+	url = git@github.com:DepthAnything/Depth-Anything-V2.git
+[submodule "third_party/ml-depth-pro"]
+	path = third_party/ml-depth-pro
+	url = git@github.com:apple/ml-depth-pro.git
+[submodule "third_party/mast3r"]
+	path = third_party/mast3r
+	url = git@github.com:naver/mast3r.git
+[submodule "third_party/SuperGluePretrainedNetwork"]
+	path = third_party/SuperGluePretrainedNetwork
+	url = https://github.com/magicleap/SuperGluePretrainedNetwork.git
+[submodule "third_party/Sky-Segmentation-and-Post-processing"]
+	path = third_party/Sky-Segmentation-and-Post-processing
+	url = https://github.com/xiongzhu666/Sky-Segmentation-and-Post-processing.git
+[submodule "third_party/RoMa"]
+	path = third_party/RoMa
+	url = git@github.com:Parskatt/RoMa.git

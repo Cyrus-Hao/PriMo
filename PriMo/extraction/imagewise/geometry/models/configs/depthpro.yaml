@@ -1,0 +1,11 @@
+dataset:
+    return_types:
+        - "image"
+        - "intrinsics"
+model:
+    name: depthpro
+    trainable: false
+    return_types: 
+        - depth
+        - valid
+    scale: 1

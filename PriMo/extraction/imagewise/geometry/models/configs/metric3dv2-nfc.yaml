@@ -1,0 +1,16 @@
+dataset:
+    return_types:
+        - "image"
+        - "intrinsics"
+model:
+    name: metric3dv2
+    write_name: metric3dv2
+    return_types: 
+        - depth
+        - depth_variance
+        - normals
+        - normals_variance
+        - normals2
+        - normals2_variance
+        - valid
+    scale: 1

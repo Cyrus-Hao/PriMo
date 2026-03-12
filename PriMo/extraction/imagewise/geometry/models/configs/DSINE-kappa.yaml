@@ -1,0 +1,13 @@
+dataset:
+    return_types:
+      - "image"
+      - "intrinsics"
+model:
+    name: dsine
+    write_name: dsine-kappa
+    config_file_name: dsine.txt
+    config_dir_name: exp002_kappa
+    return_types: 
+      - "normals"
+      - "normals_variance"
+    scale: 1

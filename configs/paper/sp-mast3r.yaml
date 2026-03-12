@@ -1,0 +1,13 @@
+defaults:
+  - ../defaults/mast3r
+extractors:
+  normals: DSINE-kappa-fc
+correspondences: 
+  cached_dense_scores: True # improves next view selection but at a cost extraction speed
+reconstruction:
+  image:
+    normals: 
+      flip_consistency: true
+matches_mode: sparse+depth+cache
+dataset:
+  resize_max: null

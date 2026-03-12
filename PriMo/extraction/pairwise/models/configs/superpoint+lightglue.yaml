@@ -1,0 +1,5 @@
+output: matches-superpoint-lightglue
+type: sparse
+model:
+  name: lightglue
+  features: superpoint

@@ -1,0 +1,28 @@
+defaults:
+  - sp-lg_m3dv2
+
+
+# 完全禁用MP-SfM特有功能
+integrate: false
+depth_consistency: false
+depth_consistency_init: false
+int_covs: false
+int_covs_every_iter: false
+masks: []
+pre_fail: false
+dc_all_frames: false
+
+# 简化BA配置
+ba:
+  depth_loss_name: "trivial"
+  ref3d_loss_name: "trivial"
+  reproj_loss_name: "SOFT_L1"
+  reproj_loss_scale: 1.0
+  scale_filter: false
+  gross_outliers: false
+
+# 禁用深度相关功能
+registration:
+  lifted_registration: false
+  use_prior_poses: true  # 启用先验外参
+  pose_config_path: "/root/autodl-tmp/mpsfm/local/example/camera_poses.yaml"  # 外参配置文件路径

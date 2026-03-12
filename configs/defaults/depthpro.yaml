@@ -1,0 +1,8 @@
+extractors:
+  depth: depthpro
+  normals: metric3dv2-normals # extractor normals from metric3dv2 wihtout caching it's depth estimates
+reconstruction:
+  image:
+    depth:
+      depth_uncertainty: 0.0875
+      prior_uncertainty: false

@@ -1,0 +1,19 @@
+dataset:
+    return_types:
+        - "image"
+        - "intrinsics"
+model:
+    name: metric3dv2
+    write_name: metric3dv2-large
+    trainable: false
+    return_types: 
+        - depth
+        - depth_variance
+        - normals
+        - normals_variance
+        - valid
+    scale: 1
+    model_name: metric_depth_vit_large_800k.pth
+    config_name: vit.raft5.large.py
+    download_method: gdown
+    download_url: 1eT2gG-kwsVzNy5nJrbm4KC-9DbNKyLnr

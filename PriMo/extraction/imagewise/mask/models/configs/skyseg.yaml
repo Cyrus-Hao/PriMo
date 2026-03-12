@@ -1,0 +1,7 @@
+dataset:
+  return_types:
+      - "image"
+model:  
+  name: skyseg
+  return_types:
+    - mask

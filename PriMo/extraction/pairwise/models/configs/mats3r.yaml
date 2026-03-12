@@ -1,0 +1,8 @@
+output: mast3r_matcher
+model:
+  name: mast3r
+type: dense
+preprocessing: 
+  resize_max: 512
+  interpolation: pil_lanczos
+resize: 512 # not used for preproc but info for kpstd scaling

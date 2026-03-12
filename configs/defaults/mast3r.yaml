@@ -1,0 +1,12 @@
+ba: 
+  metric_scale_filter: false
+reconstruction:
+  image:
+    depth: 
+      prior_std_multiplier: 0.862 
+      depth_uncertainty: null 
+extractors:
+  matcher: mats3r
+  depth: mats3r
+  normals: metric3dv2-normals # extractor normals from metric3dv2 wihtout caching it's depth estimates
+matches_mode: sparse+depth

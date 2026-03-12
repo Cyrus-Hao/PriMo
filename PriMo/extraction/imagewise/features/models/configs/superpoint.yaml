@@ -1,0 +1,9 @@
+output: feats-superpoint-nms4-n-6000-rmax1600
+model:
+  name: superpoint
+  nms_radius: 4
+  max_keypoints: 6000
+preprocessing:
+  grayscale: true
+  resize_max: 1600
+  resize_force: true

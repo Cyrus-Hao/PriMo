@@ -1,0 +1,8 @@
+# uses default configs from calss inits
+# example:
+#   see mpsfm/extraction/base.py for extraction defaults
+#   see mpsfm/sfm/mapper/base.py for mapper defaults
+
+registration:
+  use_prior_poses: true  # 启用先验外参
+  pose_config_path: "/root/autodl-tmp/mpsfm/local/example/camera_poses.yaml"  # 外参配置文件路径
