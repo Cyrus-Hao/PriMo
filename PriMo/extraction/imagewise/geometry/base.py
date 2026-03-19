@@ -17,14 +17,19 @@ def extract(data, model):
     assert len(name) == 1
     name = name[0]
 
-    scale = model.conf.scale if hasattr(model.conf, "scale") else 1
+    # `scale` is a legacy image-resize knob used by some geometry models.
+    # Newer models can expose `image_scale` to avoid colliding with
+    # model-specific numeric scale parameters.
+    scale = model.conf.image_scale if hasattr(model.conf, "image_scale") else (
+        model.conf.scale if hasattr(model.conf, "scale") else 1
+    )
     image = (data["image"].numpy()[0].transpose(1, 2, 0) * 255).astype(np.uint8)
     if scale != 1:
         image = cv2.resize(
             image,
             None,
-            fx=model.conf.scale,
-            fy=model.conf.scale,
+            fx=scale,
+            fy=scale,
             interpolation=cv2.INTER_AREA,
         )
     input_data["image"] = image

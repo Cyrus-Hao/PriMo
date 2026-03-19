@@ -1,0 +1,3 @@
+# use PromptDA for monocular depth with an external prompt depth map
+defaults:
+  - defaults/promptda

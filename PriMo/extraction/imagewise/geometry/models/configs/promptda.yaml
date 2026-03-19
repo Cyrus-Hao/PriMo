@@ -1,20 +1,28 @@
 dataset:
-  return_types:
-    - "image"
-
+    return_types:
+        - "image"
 model:
-  name: promptda
-  write_name: promptda
-  return_types:
-    - depth
-    - valid
-
-  # Depth files directory (must be set to your path)
-  depth_png_dir: /abs/path/to/depths
-
-  # If RGB and depth filenames match: xxx.jpg -> xxx.png
-  pattern_depth: "{stem}.png"
-
-  # Extra scale factor for depth values
-  scale: 1
-
+    name: promptda
+    trainable: false
+    return_types:
+        - depth
+        - valid
+    scale: 1
+    device: cuda
+    pretrained_model_name_or_path: depth-anything/prompt-depth-anything-vitl
+    pretrained_path: null
+    encoder: vitl
+    max_image_size: 1008
+    ensure_multiple_of: 14
+    force_multiple_of: true
+    prompt_depth_key: prompt_depth
+    prompt_depth_path: null
+    prompt_depth_dir: null
+    prompt_depth_suffix: ""
+    prompt_depth_ext: ".png"
+    prompt_scale_to_meter: 1.0
+    png_depth_scale: 1000.0
+    min_depth: 1.0e-6
+    max_depth: null
+    use_flip: false
+    require_download: false

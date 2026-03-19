@@ -1,11 +1,27 @@
 import argparse
+import os
 from pathlib import Path
 import sys
+
+from omegaconf import OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # 兼容旧导入：mpsfm.* -> PriMo/*
 sys.path.insert(0, str(PROJECT_ROOT / "third_party" / "mpsfm_compat"))
 sys.path.append(str(PROJECT_ROOT / "colmap" / "python" / "pycolmap"))
+
+
+def _sanitize_thread_env():
+    for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        if value.isdigit() and int(value) > 0:
+            continue
+        os.environ[key] = "1"
+
+
+_sanitize_thread_env()
 
 from mpsfm.test.simple import SimpleTest
 from mpsfm.utils.tools import load_cfg
@@ -32,9 +48,17 @@ conf = load_cfg(gvars.SFM_CONFIG_DIR / f"{args.conf}.yaml", return_name=False)
 conf.extract = args.extract
 conf.verbose = args.verbose
 
-# Resolve prior-pose path robustly after project rename.
-if getattr(conf.registration, "use_prior_poses", False):
-    requested_pose_path = args.pose_config_path or getattr(conf.registration, "pose_config_path", None)
+registration_conf = OmegaConf.select(conf, "registration")
+use_prior_poses = bool(args.pose_config_path) or bool(
+    OmegaConf.select(conf, "registration.use_prior_poses", default=False)
+)
+
+if use_prior_poses:
+    if registration_conf is None:
+        conf.registration = OmegaConf.create({})
+        registration_conf = conf.registration
+
+    requested_pose_path = args.pose_config_path or OmegaConf.select(conf, "registration.pose_config_path", default=None)
     candidate_paths = []
     if requested_pose_path:
         candidate_paths.append(Path(requested_pose_path))
@@ -48,13 +72,15 @@ if getattr(conf.registration, "use_prior_poses", False):
             break
 
     if resolved_pose_path is not None:
-        conf.registration.pose_config_path = str(resolved_pose_path)
+        registration_conf.use_prior_poses = True
+        registration_conf.pose_config_path = str(resolved_pose_path)
     else:
         print(
             "[WARN] prior pose enabled but camera_poses.yaml not found. "
             "Falling back to non-prior retrieval/registration for this run."
         )
-        conf.registration.pose_config_path = None
+        registration_conf.use_prior_poses = False
+        registration_conf.pose_config_path = None
 
 experiment = SimpleTest(conf)
 mpsfm_rec = experiment(

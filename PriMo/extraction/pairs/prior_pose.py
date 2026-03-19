@@ -1,36 +1,9 @@
 from pathlib import Path
 
 import numpy as np
-import yaml
 
 from mpsfm.utils.parsers import parse_image_lists
-
-_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
-
-
-def _pose_name_variants(image_name: str) -> list[str]:
-    stem = Path(image_name).name
-    suffix = Path(stem).suffix.lower()
-    variants = [stem]
-    if suffix in _IMAGE_SUFFIXES:
-        variants.append(Path(stem).stem)
-    else:
-        variants.append(f"{stem}.png")
-    # Preserve order while removing duplicates.
-    return list(dict.fromkeys(variants))
-
-
-def _orthogonalize_rotation(rotation: np.ndarray) -> np.ndarray:
-    u, _, vt = np.linalg.svd(rotation)
-    rot = u @ vt
-    if np.linalg.det(rot) < 0:
-        u[:, -1] *= -1
-        rot = u @ vt
-    return rot
-
-
-def _camera_center(rot: np.ndarray, trans: np.ndarray) -> np.ndarray:
-    return -rot.T @ trans
+from mpsfm.utils.prior_pose import load_prior_pose_arrays, lookup_prior_pose_entry
 
 
 def _coerce_names(names):
@@ -41,33 +14,6 @@ def _coerce_names(names):
     if isinstance(names, (str, Path)):
         return parse_image_lists(Path(names))
     raise ValueError(f"Unknown type for image list: {type(names)}")
-
-
-def _load_prior_poses(pose_config_path: Path) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    pose_config_path = Path(pose_config_path)
-    if not pose_config_path.exists():
-        raise FileNotFoundError(f"Pose config file not found: {pose_config_path}")
-
-    with open(pose_config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
-    camera_poses = config.get("camera_poses", {}) or {}
-    if len(camera_poses) == 0:
-        raise ValueError(f"No camera_poses found in {pose_config_path}")
-
-    poses = {}
-    for image_name, pose_data in camera_poses.items():
-        if "transform_matrix" not in pose_data:
-            raise ValueError(f"Missing transform_matrix for {image_name} in {pose_config_path}")
-        transform_matrix = np.asarray(pose_data["transform_matrix"], dtype=np.float64)
-        if transform_matrix.shape != (4, 4):
-            raise ValueError(f"transform_matrix for {image_name} is not 4x4")
-        rotation = _orthogonalize_rotation(transform_matrix[:3, :3])
-        translation = transform_matrix[:3, 3]
-        center = _camera_center(rotation, translation)
-        for variant in _pose_name_variants(image_name):
-            poses.setdefault(variant, (rotation, translation, center))
-
-    return poses
 
 
 def pairs_from_prior_pose(
@@ -93,16 +39,12 @@ def pairs_from_prior_pose(
     query_names = _coerce_names(query_list)
     db_names = _coerce_names(db_list)
 
-    poses = _load_prior_poses(pose_config_path)
+    poses = load_prior_pose_arrays(pose_config_path)
 
     db_entries = []
     missing_db = 0
     for name in db_names:
-        entry = None
-        for variant in _pose_name_variants(name):
-            if variant in poses:
-                entry = poses[variant]
-                break
+        entry = lookup_prior_pose_entry(poses, name)
         if entry is None:
             missing_db += 1
             continue
@@ -119,11 +61,7 @@ def pairs_from_prior_pose(
     pairs = []
     missing_query = 0
     for q_name in query_names:
-        entry = None
-        for variant in _pose_name_variants(q_name):
-            if variant in poses:
-                entry = poses[variant]
-                break
+        entry = lookup_prior_pose_entry(poses, q_name)
         if entry is None:
             missing_query += 1
             continue

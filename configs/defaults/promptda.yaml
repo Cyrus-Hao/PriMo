@@ -1,20 +1,11 @@
 extractors:
   depth: promptda
   normals: metric3dv2-normals
-  # Per-model overrides for promptda
   promptda:
-    depth_png_dir: /root/autodl-tmp/mpsfm/local/example/97/depth
-    pattern_depth: "{stem}.png"
-    scale: 1
-
+    pretrained_path: /root/autodl-tmp/PriMo/local/weights/prompt_depth_anything_vitl.ckpt
+    prompt_depth_dir: /root/autodl-tmp/PriMo/local/example/sofa/depth
 reconstruction:
   image:
     depth:
-      # PromptDA does not provide depth_variance
+      depth_uncertainty: 0.06
       prior_uncertainty: false
-      # Tune based on your depth noise level
-      depth_uncertainty: 0.079                       
-
-registration:
-  use_prior_poses: true  # 启用先验外参
-  pose_config_path: "/root/autodl-tmp/PriMo/local/example/camera_poses.yaml"  # 外参配置文件路径

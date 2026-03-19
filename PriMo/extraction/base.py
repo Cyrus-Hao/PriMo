@@ -195,7 +195,6 @@ class Extraction(BaseClass):
         depth_conf = load_cfg(extract_mono.CONFIG_DIR / f"{self.conf.depth}.yaml")
         depth_conf.dataset = OmegaConf.merge(self.conf.dataset, depth_conf.dataset)
         # Allow per-model overrides from top-level or under extractors, e.g.:
-        #   conf.promptda.{...} or conf.extractors.promptda.{...}
         model_override = getattr(self.conf, self.conf.depth, None)
         if model_override is None and hasattr(self.conf, "extractors"):
             model_override = getattr(self.conf.extractors, self.conf.depth, None)

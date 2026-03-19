@@ -1,5 +1,4 @@
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -10,37 +9,33 @@ from scipy.spatial.transform import Rotation
 from mpsfm.baseclass import BaseClass
 from mpsfm.sfm.estimators import AbsolutePose, RelativePose
 from mpsfm.utils.geometry import calculate_triangulation_angle, has_point_positive_depth
+from mpsfm.utils.prior_pose import load_prior_pose_arrays, pose_name_variants
 
 
 class MpsfmRegistration(BaseClass):
     """MP-SfM Registration class. This class is used to register images and triangulate points."""
 
     default_conf = {
-        "lifted_registration": True,  # important for ablation but can be removed
+        "lifted_registration": True,
         "absolute_pose": {},
         "relative_pose": {},
-        "reduce_min_inliers_at_failure": 6,  # release
-        # dev
-        "parallax_thresh": 1.5,  # exploration
+        "reduce_min_inliers_at_failure": 6,
+        "parallax_thresh": 1.5,
         "combined_triangle_thresh": 1.5,
-        "robust_triangles": 1,
-        "resample_bunlde": False,  # exploration,
+        "robust_triangles": 1.0,
+        "resample_bunlde": False,
         "colmap_options": "<--->",
         "verbose": 0,
-        # 先验外参配置
-        "use_prior_poses": False,  # 是否使用先验外参
-        "pose_config_path": None,  # 外参配置文件路径
+        "use_prior_poses": False,
+        "pose_config_path": None,
         "ba_refine_prior_pose": True,
-        # 初始化先验精调
         "refine_init_prior_pose": True,
         "epipolar_refine_min_matches": 12,
         "epipolar_refine_max_iters": 300,
-        # 增量阶段：使用 inliers 对先验位姿做 pose-only refine（类似 BA 固定3D点）
         "refine_remaining_prior_pose": True,
         "prior_pose_refine_min_corrs": 24,
         "prior_pose_refine_max_iters": 150,
         "prior_pose_refine_reproj_thresh": 12.0,
-        "lifted_debug_log_path": str(Path(__file__).resolve().parents[3] / "lifted_debug_log.txt"),
     }
 
     def _init(self, mpsfm_rec, correspondences, triangulator, **kwargs):
@@ -52,88 +47,31 @@ class MpsfmRegistration(BaseClass):
 
         self.half_ap_min_inliers = 0
         self.registration_cache = defaultdict(dict)
-        
-        # 初始化先验外参
         self.prior_poses = {}
         if self.conf.use_prior_poses and self.conf.pose_config_path:
             self._load_prior_poses()
-    
+
     def _load_prior_poses(self):
-        """加载先验相机外参."""
+        """Load prior camera poses from a YAML config."""
         try:
-            import yaml
-            from pathlib import Path
-            
-            pose_config_path = Path(self.conf.pose_config_path)
-            if not pose_config_path.exists():
-                print(f"Warning: Pose config file not found: {pose_config_path}")
-                return
-            
-            with open(pose_config_path, 'r') as f:
-                config = yaml.safe_load(f)
-            
-            camera_poses = config.get('camera_poses', {})
-            
-            # 解析外参矩阵
-            for image_name, pose_data in camera_poses.items():
-                transform_matrix = np.array(pose_data['transform_matrix'])
-                
-                # 转换为pycolmap格式
-                # 提取左上角3x3子矩阵（旋转矩阵）
-                rotation_matrix = transform_matrix[:3, :3]
-                # 提取第4列的前3个元素（平移向量）
-                translation = transform_matrix[:3, 3]
-                
-                # 确保旋转矩阵是正交的
-                U, _, Vt = np.linalg.svd(rotation_matrix)
-                rotation_matrix = U @ Vt
-                
-                # 创建pycolmap Rigid3d对象
-                # 直接从旋转矩阵创建Rotation3d
-                rotation = pycolmap.Rotation3d(rotation_matrix)
-                rigid_pose = pycolmap.Rigid3d(rotation, translation)
-                stem = image_name.split("/")[-1]
-                suffix = Path(stem).suffix.lower()
-                if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
-                    normalized_name = stem
-                else:
-                    normalized_name = f"{stem}.png"
-                    
-                self.prior_poses[normalized_name] = rigid_pose
-            
-            print(f"Loaded {len(self.prior_poses)} prior poses from {pose_config_path}")
-                
+            pose_entries = load_prior_pose_arrays(Path(self.conf.pose_config_path))
+            self.prior_poses = {
+                name: pycolmap.Rigid3d(pycolmap.Rotation3d(rotation), translation)
+                for name, (rotation, translation, _) in pose_entries.items()
+            }
+            print(f"Loaded {len(self.prior_poses)} prior pose entries from {self.conf.pose_config_path}")
         except Exception as e:
             print(f"Warning: Failed to load prior poses: {e}")
-    
+
     def has_prior_pose(self, image_name: str) -> bool:
-        """检查图像是否有先验外参."""
-        return image_name in self.prior_poses
-    
+        return any(name in self.prior_poses for name in pose_name_variants(image_name))
+
     def get_prior_pose(self, image_name: str):
-        """获取先验外参."""
-        return self.prior_poses.get(image_name, None)
-
-    def _write_lifted_debug_log(self, tag: str, stats: dict):
-        log_path = getattr(self.conf, "lifted_debug_log_path", None)
-        if not log_path:
-            return
-        try:
-            path = Path(log_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().isoformat(timespec="seconds")
-            payload = ", ".join(f"{key}={value}" for key, value in stats.items())
-            line = f"[{timestamp}] {tag}: {payload}\n"
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception as exc:
-            self.log(f"[LiftedDebug] failed to log {tag}: {exc}", level=2)
-
-    def _log_refine_skip(self, ref_imid, qry_imid, reason, extra=None):
-        payload = {"stage": "init_pair", "reason": reason}
-        if extra:
-            payload.update(extra)
-        self._write_lifted_debug_log(f"prior_pose_refine_{ref_imid}_{qry_imid}", payload)
+        for name in pose_name_variants(image_name):
+            pose = self.prior_poses.get(name)
+            if pose is not None:
+                return pose
+        return None
 
     @staticmethod
     def _skew(vec):
@@ -244,36 +182,20 @@ class MpsfmRegistration(BaseClass):
         self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
     ):
         if not self.conf.refine_init_prior_pose:
-            self._log_refine_skip(ref_imid, qry_imid, "disabled")
             return T_c2w, False, {}
         matches = np.asarray(matches)
         min_matches = self.conf.epipolar_refine_min_matches
         if len(matches) < min_matches:
-            self._log_refine_skip(
-                ref_imid,
-                qry_imid,
-                "insufficient_matches",
-                {"num_matches": int(len(matches)), "required": int(min_matches)},
-            )
             return T_c2w, False, {}
 
         pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
         pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
         if len(pts1) < min_matches:
-            self._log_refine_skip(
-                ref_imid,
-                qry_imid,
-                "insufficient_normalized_matches",
-                {"num_matches": int(len(pts1)), "required": int(min_matches)},
-            )
             return T_c2w, False, {}
 
         R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
         baseline_norm = float(np.linalg.norm(t_rel))
         if baseline_norm < 1e-9:
-            self._log_refine_skip(
-                ref_imid, qry_imid, "zero_baseline", {"baseline_norm": baseline_norm, "num_matches": int(len(pts1))}
-            )
             return T_c2w, False, {}
         t_rel = self._normalize_translation(t_rel)
 
@@ -314,30 +236,9 @@ class MpsfmRegistration(BaseClass):
             )
         except Exception as exc:
             self.log(f"[InitPair] Epipolar refine failed: {exc}", level=1)
-            payload = {
-                "error": str(exc),
-                "baseline_norm": baseline_norm,
-                "residual_before_rms": stats_before["rms"],
-                "num_matches": stats_before["count"],
-            }
-            self._log_refine_skip(ref_imid, qry_imid, "solver_exception", payload)
             return T_c2w, False, {}
 
         if not result.success:
-            R_tmp, t_tmp = self._compose_left_se3_delta(R_rel, t_rel, result.x)
-            t_tmp = self._normalize_translation(t_tmp)
-            stats_tmp = residual_stats(R_tmp, t_tmp)
-            payload = {
-                "message": getattr(result, "message", ""),
-                "status": getattr(result, "status", None),
-                "baseline_norm": baseline_norm,
-                "residual_before_rms": stats_before["rms"],
-                "residual_current_rms": stats_tmp["rms"],
-                "residual_current_p95": stats_tmp["abs_p95"],
-                "nfev": int(result.nfev),
-                "max_nfev": int(self.conf.epipolar_refine_max_iters),
-            }
-            self._log_refine_skip(ref_imid, qry_imid, "solver_failed", payload)
             return T_c2w, False, {}
 
         R_opt, t_opt = self._compose_left_se3_delta(R_rel, t_rel, result.x)
@@ -406,8 +307,81 @@ class MpsfmRegistration(BaseClass):
             candidate_points["xyz"].append(out["xyz"])
         return candidate_points
 
+    def _estimate_init_rescale(self, ref_imid, kps_ref, T_ref_cw, candidate_points):
+        if len(candidate_points.get("xyz", [])) == 0:
+            return 1.0
+        tri_world = np.vstack(candidate_points["xyz"])
+        tri_cam = T_ref_cw * tri_world
+        z = tri_cam[:, -1]
+        mask = np.asarray(candidate_points["pt2d_id_1"], dtype=int)
+        d = self.mpsfm_rec.images[ref_imid].depth.data_prior_at_kps(kps_ref[mask])
+        return np.median(z / d)
+
+    def _merge_candidate_points(self, points_lifted, points_triangulated):
+        candidate_points = {}
+        ids_lift_1 = points_lifted.get("pt2d_id_1", [])
+        ids_lift_2 = points_lifted.get("pt2d_id_2", [])
+        ids_tri_1 = points_triangulated.get("pt2d_id_1", [])
+        ids_tri_2 = points_triangulated.get("pt2d_id_2", [])
+
+        keys = list(points_lifted.keys()) if len(points_lifted) else list(points_triangulated.keys())
+        if not keys:
+            keys = ["pt2d_id_1", "pt2d_id_2", "tri_angle", "posdepth1", "posdepth2", "xyz"]
+        for key in keys:
+            candidate_points[key] = []
+
+        tri_map = defaultdict(list)
+        for idx, pair in enumerate(zip(ids_tri_1, ids_tri_2)):
+            tri_map[pair].append(idx)
+
+        for idx_lift, pair in enumerate(zip(ids_lift_1, ids_lift_2)):
+            if pair in tri_map and tri_map[pair]:
+                idx_tri = tri_map[pair].pop(0)
+                use_lift = points_triangulated["tri_angle"][idx_tri] < self.conf.combined_triangle_thresh
+                src = points_lifted if use_lift else points_triangulated
+                src_idx = idx_lift if use_lift else idx_tri
+                for key in keys:
+                    candidate_points[key].append(src[key][src_idx])
+                continue
+
+            if points_lifted["tri_angle"][idx_lift] < self.conf.combined_triangle_thresh:
+                for key in keys:
+                    candidate_points[key].append(points_lifted[key][idx_lift])
+
+        for tri_indices in tri_map.values():
+            for idx_tri in tri_indices:
+                if points_triangulated["tri_angle"][idx_tri] >= self.conf.combined_triangle_thresh:
+                    for key in keys:
+                        candidate_points[key].append(points_triangulated[key][idx_tri])
+
+        return candidate_points
+
+    def _collect_prior_inlier_masks(self, imid, ref_imids, T_qry_cw, camera_qry, kps_qry, log_stage):
+        inlier_masks = {}
+        for ref_id in ref_imids:
+            image_ref = self.mpsfm_rec.images[ref_id]
+            camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
+            matches_ref_qry = self.correspondences.matches(ref_id, imid)
+            if len(matches_ref_qry) == 0:
+                inlier_masks[ref_id] = np.zeros(0, dtype=bool)
+                continue
+            kps_ref = self.mpsfm_rec.keypoints(ref_id)
+            inlier_masks[ref_id] = self._inlier_mask_for_pair_under_pose(
+                ref_id,
+                imid,
+                image_ref.cam_from_world,
+                T_qry_cw,
+                camera_ref,
+                camera_qry,
+                matches_ref_qry,
+                kps_ref,
+                kps_qry,
+                log_stage=log_stage,
+            )
+        return inlier_masks
+
     def _find_2D3D_pairs_with_inlier_mask(self, im_ref_id, imid, image_ref, image, inlier_mask, pair2D3D):
-        """基于给定 inlier_mask 收集 ref->qry 的 2D-3D 对应."""
+        """Collect ref-to-query 2D-3D pairs under a fixed inlier mask."""
         corr = self.correspondences.matches(im_ref_id, imid)
         if len(corr) == 0:
             pair2D3D["2d"] = np.zeros((0, 2))
@@ -649,9 +623,6 @@ class MpsfmRegistration(BaseClass):
                     "tri_inliers": 0,
                     "tri_kept": len(tri_candidates),
                 }
-            if log_stage is not None:
-                stats["stage"] = log_stage
-            self._write_lifted_debug_log(f"prior_mask_ref{ref_imid}_qry{qry_imid}", stats)
             return mask_out
 
         xyz_world = np.array([cand["xyz"] for cand in combined_candidates])
@@ -700,10 +671,6 @@ class MpsfmRegistration(BaseClass):
             "tri_inliers": tri_inliers,
             "tri_kept": tri_candidates_kept,
         }
-        if log_stage is not None:
-            stats["stage"] = log_stage
-        self._write_lifted_debug_log(f"prior_mask_ref{ref_imid}_qry{qry_imid}", stats)
-
         return mask_out
 
     def _find_2D3D_pairs(self, im_ref_id, imid, image_ref, image, pair2D3D):
@@ -761,21 +728,11 @@ class MpsfmRegistration(BaseClass):
         valid_lifted_cached = None
 
         if prior2 is not None:
-            # 完全跳过 AP 和 E，直接使用先验
             T_c2w = self.mpsfm_rec.align_prior_pose_to_current_world(prior2)
-            # 用先验位姿直接三角化，估计尺度用于lifted重标定（可选，存在三角化成功时）
             pts_tri_prior = self._candidate_points3D_for_init(
                 T_c1w, T_c2w, matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
             )
-            if len(pts_tri_prior["xyz"]) > 0:
-                tri_world = np.vstack(pts_tri_prior["xyz"])  # (N,3) 世界
-                tri_cam1 = T_c1w * tri_world
-                z = tri_cam1[:, -1]
-                mask = np.array(list(pts_tri_prior["pt2d_id_1"]))
-                d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
-                rescale = np.median(z / d)
-            
-            # 基于先验位姿计算 inlier mask（用于内点筛选与DC重采样）
+            rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_prior)
             prior_inlier_mask = self._inlier_mask_for_pair_under_pose(
                 imid1,
                 imid2,
@@ -788,23 +745,11 @@ class MpsfmRegistration(BaseClass):
                 kps2,
                 log_stage="pre_refine",
             )
-            # suppress prior inlier summary printing
-            # 保存为“当前（imid2）相对参考（imid1）”的内点掩码，供 DC 失败时使用
             self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
-            # 采用先验内点作为初始匹配，若过少则退回全部匹配
             ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
             prior_inliers = int(prior_inlier_mask.sum())
             fallback_thresh = max(3, ap_min_num_inliers // 2)
             use_prior_only = prior_inliers >= fallback_thresh
-            self._write_lifted_debug_log(
-                f"prior_match_select_{imid1}_{imid2}",
-                {
-                    "fallback_threshold": fallback_thresh,
-                    "prior_inliers": prior_inliers,
-                    "total_matches": len(matches),
-                    "use_prior_only": use_prior_only,
-                },
-            )
             matches_used = matches[prior_inlier_mask] if use_prior_only else matches
 
             if self.conf.refine_init_prior_pose:
@@ -814,9 +759,6 @@ class MpsfmRegistration(BaseClass):
                 )
                 if refined_ok:
                     T_c2w = T_c2w_refined
-                    refine_log = {"stage": "init_pair"}
-                    refine_log.update(refine_stats)
-                    self._write_lifted_debug_log(f"prior_pose_refine_{imid1}_{imid2}", refine_log)
                     refined_mask = self._inlier_mask_for_pair_under_pose(
                         imid1,
                         imid2,
@@ -835,9 +777,7 @@ class MpsfmRegistration(BaseClass):
                         matches_used = matches[refined_mask]
                     else:
                         matches_used = matches
-            
         else:
-            # 先尝试 AP（若有 prior1 则在其世界系下，否则 cam1 世界系为单位）
             unproj_cam0, valid_lifted0 = self._lift_points_for_init(imid1, kps1, camera1)
             valid_matches0 = matches[valid_lifted0[matches[:, 0]]]
             unproj_world0 = T_c1w.inverse() * unproj_cam0
@@ -846,17 +786,8 @@ class MpsfmRegistration(BaseClass):
             )
             ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
             ap_sufficient = (AP_info is not None) and (AP_info["num_inliers"] >= ap_min_num_inliers)
-            try:
-                ap_inl = AP_info["num_inliers"] if AP_info is not None else 0
-                self.log(
-                    f"[AP] ap_inliers={ap_inl}, ap_min_required={ap_min_num_inliers}, ap_sufficient={ap_sufficient}",
-                    level=0,
-                )
-            except Exception:
-                pass
 
             if ap_sufficient:
-                # AP 充分：进行高/低视差判定（需一次 E 以获得三角角）
                 E_info = self.relative_pose_estimator(
                     kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2
                 )
@@ -869,44 +800,26 @@ class MpsfmRegistration(BaseClass):
                 high_parallax = (triangles > self.conf.parallax_thresh).sum() > AP_info["num_inliers"]
 
                 if high_parallax:
-                    # 高视差：采用 E 位姿与 E 内点，并用 E 三角化估计尺度
                     T_c2w = T_c2w_e
                     matches_used = inlier_matches_e
-                    if len(pts_tri_e["xyz"]) > 0:
-                        tri_world = np.vstack(pts_tri_e["xyz"])  # (N,3)
-                        tri_cam1 = T_c1w * tri_world
-                        z = tri_cam1[:, -1]
-                        mask = np.array(list(pts_tri_e["pt2d_id_1"]))
-                        d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
-                        rescale = np.median(z / d)
+                    rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_e)
                 else:
-                    # 低视差：采用 AP 位姿与 AP 内点，并复用此前 lift
                     T_c2w = AP_info["cam_from_world"]
                     matches_used = valid_matches0[AP_info["inlier_mask"]]
-                    rescale = 1
                     unproj_cam_cached = unproj_cam0
                     valid_lifted_cached = valid_lifted0
             else:
-                # 回退到 E
                 E_info = self.relative_pose_estimator(
                     kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2
                 )
                 inlier_matches = matches[E_info["inlier_mask"]]
                 T_c2w = E_info["cam2_from_cam1"] * T_c1w
                 matches_used = inlier_matches
-                # 用 E 位姿进行三角化，估计尺度
                 pts_tri_e = self._candidate_points3D_for_init(
                     T_c1w, T_c2w, inlier_matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
                 )
-                if len(pts_tri_e["xyz"]) > 0:
-                    tri_world = np.vstack(pts_tri_e["xyz"])  # (N,3) 世界
-                    tri_cam1 = T_c1w * tri_world
-                    z = tri_cam1[:, -1]
-                    mask = np.array(list(pts_tri_e["pt2d_id_1"]))
-                    d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
-                    rescale = np.median(z / d)
+                rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_e)
 
-        # 统一候选生成（若无需重标定且已有缓存，则复用 lift）
         if rescale == 1 and unproj_cam_cached is not None:
             unproj_cam, valid_lifted = unproj_cam_cached, valid_lifted_cached
         else:
@@ -918,47 +831,11 @@ class MpsfmRegistration(BaseClass):
         pts_tri = self._candidate_points3D_for_init(
             T_c1w, T_c2w, matches_used, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
         )
+        cand = self._merge_candidate_points(pts_lift, pts_tri)
 
-        # 合并（按 (pt2d_id_1, pt2d_id_2) 对齐，避免重复匹配错配）
-        cand = {}
-        ids1 = pts_lift.get("pt2d_id_1", [])
-        ids1_b = pts_lift.get("pt2d_id_2", [])
-        ids2 = pts_tri.get("pt2d_id_1", [])
-        ids2_b = pts_tri.get("pt2d_id_2", [])
-
-        keys = pts_lift.keys() if len(pts_lift) else pts_tri.keys()
-        for k in keys:
-            cand[k] = []
-
-        tri_map = defaultdict(list)
-        for i, pair in enumerate(zip(ids2, ids2_b)):
-            tri_map[pair].append(i)
-
-        # 先处理 lift 中的元素：如 tri 中有同 pair，则选择 lift/tri；否则走 lift-only
-        for i, pair in enumerate(zip(ids1, ids1_b)):
-            if pair in tri_map and tri_map[pair]:
-                i_tri = tri_map[pair].pop(0)
-                use_lift = pts_tri["tri_angle"][i_tri] < self.conf.combined_triangle_thresh
-                src = pts_lift if use_lift else pts_tri
-                idx = i if use_lift else i_tri
-                for k in keys:
-                    cand[k].append(src[k][idx])
-            else:
-                if pts_lift["tri_angle"][i] < self.conf.combined_triangle_thresh:
-                    for k in keys:
-                        cand[k].append(pts_lift[k][i])
-
-        # tri-only（剩余未匹配的 pair）
-        for tri_indices in tri_map.values():
-            for i_tri in tri_indices:
-                if pts_tri["tri_angle"][i_tri] >= self.conf.combined_triangle_thresh:
-                    for k in keys:
-                        cand[k].append(pts_tri[k][i_tri])
-
-        # 赋姿并注册
         self.mpsfm_rec.images[imid1].cam_from_world = T_c1w
         self.mpsfm_rec.images[imid2].cam_from_world = T_c2w
-        
+
         self.mpsfm_rec.register_image(imid1)
         self.mpsfm_rec.register_image(imid2)
         if len(cand.get("xyz", [])) < 3:
@@ -986,82 +863,42 @@ class MpsfmRegistration(BaseClass):
         image = self.mpsfm_rec.images[imid]
         camera = self.mpsfm_rec.rec.cameras[image.camera_id]
 
-        # 检查是否有先验外参
         image_name = image.name
         prior_pose = self.get_prior_pose(image_name)
         if prior_pose is not None:
             self._update_world_sim_from_priors()
             image.cam_from_world = self.mpsfm_rec.align_prior_pose_to_current_world(prior_pose)
 
-            # 在使用先验直接注册前，生成与所有参考图像的 inlier masks
             if ref_imids is None:
                 ref_imids = self.mpsfm_rec.registered_images.keys()
             ref_imids = list(ref_imids)
 
             kps_qry = self.mpsfm_rec.keypoints(imid)
             camera_qry = camera
-            inlier_masks_map = {}
-            for ref_id in ref_imids:
-                image_ref = self.mpsfm_rec.images[ref_id]
-                camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
-                matches_ref_qry = self.correspondences.matches(ref_id, imid)
-                if len(matches_ref_qry) == 0:
-                    inlier_masks_map[ref_id] = np.zeros(0, dtype=bool)
-                    continue
-                kps_ref = self.mpsfm_rec.keypoints(ref_id)
-                # 简化策略：重投影一律使用参考帧“当前估计位姿”（已被BA优化过的 cam_from_world）
-                T_ref_cw = image_ref.cam_from_world
-                T_qry_cw = image.cam_from_world
-                mask = self._inlier_mask_for_pair_under_pose(
-                    ref_id,
-                    imid,
-                    T_ref_cw,
-                    T_qry_cw,
-                    camera_ref,
-                    camera_qry,
-                    matches_ref_qry,
-                    kps_ref,
-                    kps_qry,
-                    log_stage="register_next",
-                )
-                inlier_masks_map[ref_id] = mask
+            inlier_masks_map = self._collect_prior_inlier_masks(
+                imid,
+                ref_imids,
+                image.cam_from_world,
+                camera_qry,
+                kps_qry,
+                log_stage="register_next",
+            )
 
-            # 用 inliers 对当前待注册图像的 prior pose 做一次 pose-only 精调（类似 BA 固定3D点）
             refined_pose, refined_ok, refine_stats = self._refine_prior_pose_with_inliers(
                 imid, ref_imids, inlier_masks_map, image.cam_from_world
             )
             if refined_ok:
                 image.cam_from_world = refined_pose
-                self._write_lifted_debug_log(f"prior_pose_refine_im{imid}", refine_stats)
-                # 位姿更新后，重算 inlier mask，确保后续 DC 使用的是 refined pose 的内点
-                refreshed_masks = {}
-                T_qry_cw = image.cam_from_world
-                for ref_id in ref_imids:
-                    image_ref = self.mpsfm_rec.images[ref_id]
-                    camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
-                    matches_ref_qry = self.correspondences.matches(ref_id, imid)
-                    if len(matches_ref_qry) == 0:
-                        refreshed_masks[ref_id] = np.zeros(0, dtype=bool)
-                        continue
-                    kps_ref = self.mpsfm_rec.keypoints(ref_id)
-                    T_ref_cw = image_ref.cam_from_world
-                    refreshed_masks[ref_id] = self._inlier_mask_for_pair_under_pose(
-                        ref_id,
-                        imid,
-                        T_ref_cw,
-                        T_qry_cw,
-                        camera_ref,
-                        camera_qry,
-                        matches_ref_qry,
-                        kps_ref,
-                        kps_qry,
-                        log_stage="register_next_refined",
-                    )
-                inlier_masks_map = refreshed_masks
+                inlier_masks_map = self._collect_prior_inlier_masks(
+                    imid,
+                    ref_imids,
+                    image.cam_from_world,
+                    camera_qry,
+                    kps_qry,
+                    log_stage="register_next_refined",
+                )
 
-            # 供 DC 失败时移除“好内点”使用
             self.mpsfm_rec.last_ap_inlier_masks = inlier_masks_map
-            # 最后注册图像
             self.mpsfm_rec.register_image(imid)
             return True
 
@@ -1175,112 +1012,9 @@ class MpsfmRegistration(BaseClass):
 
         return self.triangulate_image(imid)
 
-    def _init_pair_points_and_pose(self, imid1, imid2, kps1, kps2, matches, camera1, camera2):
-        E_info = self.relative_pose_estimator(kps1[matches[:, 0]], kps2[matches[:, 1]], camera1, camera2)
-
-        inlier_matches = matches[E_info["inlier_mask"]]
-        points_triangulated = self._candidate_points3D_for_init(
-            pycolmap.Rigid3d(),
-            E_info["cam2_from_cam1"],
-            inlier_matches,
-            self.mpsfm_rec.images[imid1],
-            self.mpsfm_rec.images[imid2],
-            camera1,
-            camera2,
-        )
-
-        unproj_3D1, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1)
-        valid_matches = matches[valid_lifted[matches[:, 0]]]
-        AP_info = self.absolute_pose_estimator(kps2[valid_matches[:, 1]], unproj_3D1[valid_matches[:, 0]], camera2)
-        triangles = np.array(points_triangulated["tri_angle"])
-        if AP_info is None:
-            high_parallax = True
-        else:
-            high_parallax = (triangles > self.conf.parallax_thresh).sum() > AP_info["num_inliers"]
-        if self.conf.verbose > 1:
-            print(" -- INIT INFO --")
-            print(f"\t        num E inliers: {triangles.shape[0]}")
-            print(f"\tnum E w/ triangle>1.5: {(triangles>1.5).sum()}")
-            print(
-                f"\tnum E w/ triangle>{self.conf.combined_triangle_thresh}: "
-                f"\t{(triangles>self.conf.combined_triangle_thresh).sum()}"
-            )
-        if AP_info is not None and self.conf.verbose > 1:
-            print(f"\t       num AP inliers: {AP_info['num_inliers']}")
-        if high_parallax:
-            cam_from_world2 = E_info["cam2_from_cam1"]
-
-            # gathering lifted and triangulated points
-            triangulated_z = np.vstack(points_triangulated["xyz"])[:, -1]
-            mask = np.array(list(points_triangulated["pt2d_id_1"]))
-            d = self.mpsfm_rec.images[imid1].depth.data_prior_at_kps(kps1[mask])
-            rescale = np.median(triangulated_z / d)
-            unproj_3D1, valid_lifted = self._lift_points_for_init(imid1, kps1, camera1, rescale=rescale)
-            valid_matches = inlier_matches[valid_lifted[inlier_matches[:, 0]]]
-            points_lifted = self._candidate_lift_for_init(
-                pycolmap.Rigid3d(), cam_from_world2, valid_matches, unproj_3D1
-            )
-
-        else:
-            cam_from_world2 = AP_info["cam_from_world"]
-            points_lifted = self._candidate_lift_for_init(
-                pycolmap.Rigid3d(), cam_from_world2, valid_matches, unproj_3D1, AP_info["inlier_mask"]
-            )
-            # gathering lifted and triangulated points
-            points_triangulated = self._candidate_points3D_for_init(
-                pycolmap.Rigid3d(),
-                cam_from_world2,
-                valid_matches[AP_info["inlier_mask"]],
-                self.mpsfm_rec.images[imid1],
-                self.mpsfm_rec.images[imid2],
-                camera1,
-                camera2,
-            )
-
-        # combining lifted and triangulated points
-        candidate_points = {}
-        ids1 = points_lifted.get("pt2d_id_1", [])
-        ids1_b = points_lifted.get("pt2d_id_2", [])
-        ids2 = points_triangulated.get("pt2d_id_1", [])
-        ids2_b = points_triangulated.get("pt2d_id_2", [])
-
-        keys = points_lifted.keys() if len(points_lifted) else points_triangulated.keys()
-        if not keys:
-            keys = ["pt2d_id_1", "pt2d_id_2", "tri_angle", "posdepth1", "posdepth2", "xyz"]
-        for k in keys:
-            candidate_points[k] = []
-
-        tri_map = defaultdict(list)
-        for i, pair in enumerate(zip(ids2, ids2_b)):
-            tri_map[pair].append(i)
-
-        # 先处理 lift 中的元素：如 tri 中有同 pair，则选择 lift/tri；否则走 lift-only
-        for i, pair in enumerate(zip(ids1, ids1_b)):
-            if pair in tri_map and tri_map[pair]:
-                i_tri = tri_map[pair].pop(0)
-                use_lift = points_triangulated["tri_angle"][i_tri] < self.conf.combined_triangle_thresh
-                src = points_lifted if use_lift else points_triangulated
-                idx = i if use_lift else i_tri
-                for k in keys:
-                    candidate_points[k].append(src[k][idx])
-            else:
-                if points_lifted["tri_angle"][i] < self.conf.combined_triangle_thresh:
-                    for k in keys:
-                        candidate_points[k].append(points_lifted[k][i])
-
-        # tri-only（剩余未匹配的 pair）
-        for tri_indices in tri_map.values():
-            for i_tri in tri_indices:
-                if points_triangulated["tri_angle"][i_tri] >= self.conf.combined_triangle_thresh:
-                    for k in keys:
-                        candidate_points[k].append(points_triangulated[k][i_tri])
-        return candidate_points, cam_from_world2
-
     def _collect_pairs(
         self, im_ref_id, image_ref, image, pts2d_ids_ref, pts2d_ids_qry, use_3d, point3D_ids, pair2D3D, **kwrags
     ):
-        used_matches = []
-
         pair2D3D["2d"] = np.array([image.points2D[pt].xy for pt in pts2d_ids_qry])
         pair2D3D["3d"] = np.ones((pts2d_ids_ref.shape[0], 3)) * -1
         if sum(use_3d) > 0:
@@ -1302,12 +1036,11 @@ class MpsfmRegistration(BaseClass):
                 )
 
             pair2D3D["lifted"] = ~use_3d
-            # 若 lifted/3D 数量不匹配，后续流程会在断言处报错
         if not self.conf.lifted_registration:
             pair2D3D["3d"] = pair2D3D["3d"][use_3d]
             pair2D3D["2d"] = pair2D3D["2d"][use_3d]
         pair2D3D["3dids"] = point3D_ids
-        return used_matches, pair2D3D
+        return pair2D3D
 
     def _lift_points_to_3d(self, im_ref_id, image_ref, liftref_2d):
         """Lift 2D points to 3D space using depth maps and camera transformations."""

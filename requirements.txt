@@ -13,6 +13,7 @@ plotly
 nbformat
 ipywidgets
 gdown
+huggingface_hub
 
 # -- Extraction --
 # LightGlue
