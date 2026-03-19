@@ -4,6 +4,8 @@ PriMo is a prior-guided mobile reconstruction project built on top of [MP-SfM](h
 
 Compared with the original MP-SfM codebase, PriMo mainly adds **mobile prior pose integration**, **prior-pose-driven pair selection**, **prior pose refinement during registration**, and **optional PromptDA depth prompting** for ARKit-like captures.
 
+![PriMo Pipeline](./assets/pipeline.png)
+
 ## ✨ Overview
 
 PriMo focuses on making MP-SfM work better for mobile captures where image evidence alone is not reliable enough. In the current codebase, this is done by injecting prior information into the original pipeline rather than replacing it.
@@ -53,7 +55,8 @@ pip install -r requirements.txt
 python -m pip install -e .
 ```
 
-### Optional
+<details>
+<summary>Optional</summary>
 
 - For faster inference with transformer-based models, install [xformers](https://github.com/facebookresearch/xformers).
 - For faster MASt3R matching, compile the CUDA kernels for RoPE:
@@ -84,7 +87,10 @@ pip install -e . --no-deps
 cd $DIR
 ```
 
-### Docker
+</details>
+
+<details>
+<summary>Docker</summary>
 
 This repository already provides a `Dockerfile`, but it is closer to an MP-SfM-style base environment than a fully pre-baked PriMo runtime image.
 
@@ -129,9 +135,21 @@ pip install -e . --no-deps
 cd $DIR
 ```
 
+</details>
+
 ### 3. Prepare mobile pose and intrinsics files
 
-PriMo includes `camera_processor.py` to convert mobile capture metadata into PriMo-compatible YAML files.
+If you want to use **prior poses**, the current PriMo workflow expects a `camera_poses.yaml` file and matching `intrinsics.yaml`.
+
+PriMo includes `camera_processor.py` to convert mobile capture metadata into these PriMo-compatible YAML files. In the current project, this script is **specifically tailored to Stray Scanner exports**, and is meant to process the ARKit-style:
+
+- `camera_matrix.csv`
+- `odometry.csv`
+
+into:
+
+- `camera_poses.yaml`
+- `intrinsics.yaml`
 
 ```bash
 python camera_processor.py \
@@ -146,6 +164,8 @@ This writes:
 
 - `local/example/camera_poses.yaml`
 - `local/example/intrinsics.yaml`
+
+In other words, `camera_processor.py` is the bridge from **Stray Scanner's ARKit prior pose matrix / odometry export** to the prior-pose format used by PriMo.
 
 ### 4. Run reconstruction
 
@@ -177,6 +197,12 @@ PriMo is not a full rewrite of MP-SfM. Instead, it introduces a small number of 
 
 PriMo also supports Prompt Depth Anything for mobile captures with rough sensor depth, such as ARKit or Stray Scanner depth maps.
 
+In the current project, the PromptDA integration is intended for **Stray Scanner's exported ARKit depth maps**. The expected setup is:
+
+- RGB images in `local/example/images`
+- aligned ARKit depth prompt maps in a directory such as `.../depth`
+- one prompt depth file per RGB frame, typically stored as `.png`
+
 Configure `configs/defaults/promptda.yaml` with:
 
 ```yaml
@@ -201,6 +227,13 @@ python reconstruct.py \
 ```
 
 By default, PromptDA depth prompts are expected as `.png` files and interpreted as millimeter depth, which is converted internally to meters.
+
+So in practice:
+
+- `camera_processor.py` handles **Stray Scanner -> ARKit prior pose / intrinsics**
+- `PromptDA` handles **Stray Scanner -> ARKit depth prompt maps**
+
+These two inputs complement each other in the current PriMo workflow.
 
 ## Repository Structure
 
@@ -243,3 +276,12 @@ We also gratefully acknowledge the open-source projects used in this repository 
 - [NetVLAD](https://github.com/Relja/netvlad)
 
 We especially thank [MP-SfM](https://github.com/cvg/mpsfm), since PriMo directly extends its reconstruction framework rather than starting from scratch.
+
+## 📸 Running on Your Own Capture
+
+You can use the [Stray Scanner App](https://apps.apple.com/us/app/stray-scanner/id1557051662) to capture your own data. This requires iPhone 12 Pro or later Pro models, or iPad 2020 Pro or later Pro models.
+
+In the current PriMo workflow, Stray Scanner is especially useful because:
+
+- its ARKit pose export can be converted by `camera_processor.py` into PriMo prior poses and intrinsics,
+- its ARKit depth export can be used as PromptDA depth prompts.

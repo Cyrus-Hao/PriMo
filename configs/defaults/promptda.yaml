@@ -7,5 +7,5 @@ extractors:
 reconstruction:
   image:
     depth:
-      depth_uncertainty: 0.06
+      depth_uncertainty: 0.079
       prior_uncertainty: false
