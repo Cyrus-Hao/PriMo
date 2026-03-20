@@ -7,7 +7,7 @@ from omegaconf import OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 # 兼容旧导入：mpsfm.* -> PriMo/*
-sys.path.insert(0, str(PROJECT_ROOT / "third_party" / "mpsfm_compat"))
+sys.path.insert(0, str(PROJECT_ROOT / "third_party"))
 sys.path.append(str(PROJECT_ROOT / "colmap" / "python" / "pycolmap"))
 
 
