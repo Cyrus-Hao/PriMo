@@ -85,5 +85,4 @@ cython_debug/
 ceres-solver-2.2.0/
 colmap/
 pyceres/
-third_party/
 tools/

@@ -75,7 +75,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 python3-pip \
         python-is-python3 \
-        git \ 
+        git \
         wget \
         libboost-program-options-dev \
         libatlas-base-dev \
@@ -87,7 +87,6 @@ RUN apt-get update && \
         libqt5gui5 \
         libqt5widgets5 \
         libcurl4 \
-        # needed for compiling cuda kernels during runtime
         ninja-build \
         build-essential \
         python3-dev \
@@ -97,7 +96,7 @@ RUN apt-get update && \
 COPY --from=builder /usr/local/ /usr/local/
 ENV PATH=/usr/local/bin:$PATH
 
-WORKDIR /mpsfm
+WORKDIR /workspace/PriMo
 # Install Python requirements & finalize
 COPY requirements.txt .
 RUN python3 -m pip install --upgrade pip && \
