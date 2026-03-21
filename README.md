@@ -34,7 +34,7 @@ PriMo follows the same core environment stack as [MP-SfM](https://github.com/cvg
 ### 1. Clone the repository and submodules
 
 ```bash
-git clone --recursive <your-repo-url>
+git clone --recursive https://github.com/Cyrus-Hao/PriMo
 cd PriMo
 ```
 
