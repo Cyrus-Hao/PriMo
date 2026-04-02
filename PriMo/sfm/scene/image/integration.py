@@ -132,6 +132,8 @@ class Integration(IntVars):
 
     def integrate(self, cache_device="cpu"):
         """Integrate depth map from normals with depth constraints."""
+        if self.depth is None:
+            return False
         assert self.image.has_pose and self.depth.activated, "Image not registered or depth map not activated"
         variables, success = self._prepare_integration_variables()
         if (not success) or (variables is None):

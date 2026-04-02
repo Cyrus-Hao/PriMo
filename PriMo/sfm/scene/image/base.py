@@ -97,6 +97,9 @@ class Image(ColmapImageWrapper, BaseClass, Integration):
         self.image = self.mpsfm_rec.images[self.imid]
         self.masks_path = masks_path
 
+        if self.depth_dir is None:
+            return
+
         mask = self.load_masks_data()
         if self.conf.depth_type == "monocular":
             depth_dict = self.load_depth_data(**kwargs)

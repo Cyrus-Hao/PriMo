@@ -64,6 +64,8 @@ class Optimizer(BaseClass):
         for imid in optim_ids:
             # 获取当前图像对象 image包含图像的元数据，如特征点、深度图、相机姿态
             image = self.mpsfm_rec.images[imid]
+            if image.depth is None:
+                continue
             # 获取相机内参（焦距 主点等）
             camera = self.mpsfm_rec.rec.cameras[image.camera_id]
             # 获取与3D点关联的2D观测点索引 表示图像中具有有效2D-3D对应关系的观测点
@@ -154,84 +156,59 @@ class Optimizer(BaseClass):
         for ii, imid in enumerate(optim_ids):
             image = self.mpsfm_rec.images[imid]
             pose = image.cam_from_world
-            # 处理深度数据（先添加残差，确保相关参数块已被注册）
-            # 跳过未激活深度
-            if not image.depth.activated:
-                continue
-            image = self.mpsfm_rec.images[imid]
-            # p2Ds:2D 关键点索引
-            p2Ds = np.array(image.get_observation_point2D_idxs())
-            # kps_with3D：关键点坐标
-            kps_with3D = image.keypoint_coordinates(p2Ds)
-            # 深度有效性掩码 bool 上面代码所示那些点的深度值有效
-            valid = image.depth.valid_at_kps(kps_with3D)
-            kps_with3D = kps_with3D[valid]
-            # 根据 depth_type，选择更新深度（data_at_kps）或初始深度（data_prior_at_kps）
-            if depth_type == "update":
-                depths = image.depth.data_at_kps(kps_with3D)
-            else:
-                depths = image.depth.data_prior_at_kps(kps_with3D)
-            p2Ds = p2Ds[valid]
-            # p3Ds: 对应的 3D 点 ID
-            p3Ds = image.point3D_ids(p2Ds)
-            # depth3d: 投影深度，从 3D 点投影到图像平面
-            _, _, _, depth3d, _ = self.mpsfm_rec.project_image_3d_points(imid, p3Ds)
-            # 异常值过滤
-            # 初始掩码剔除非正深度
-            mask = depths > 0
-            # 同时剔除投影为负的 3D 深度（点在相机后方）
-            mask *= depth3d > 0
-            # 尺度过滤 上面代码参数所示 仅保留比率在 [1/1.5, 1.5]内的点
-            if allow_scale_filter and self.conf.scale_filter:
-                div = depths / depth3d
-                mask *= (div < scale_filter_factor) * (div > (1 / scale_filter_factor))
-            uncertainty_update = image.depth.uncertainty_update
-            # 方差variances 从 uncertainty_update 获取 表示深度不确定性
-            variances = np.array([uncertainty_update[pt2D_id] for pt2D_id in p2Ds])
-            # 计算白化对数深度差 whitened 剔除超出 3 个标准差的点
-            if gross_outliers and image.depth.activated:
-                whitened = np.abs(np.log(depths).clip(1e-6, None) - np.log(depth3d).clip(1e-6, None)) / variances ** 0.5
-                mask *= whitened < 3
-            # 应用掩码
-            # 若无有效点（np.sum(mask) == 0）跳过当前图像
-            if np.sum(mask) == 0:
-                print("No valid points for depth regularizing")
-                continue
-            # 仅保留 mask=True 的点
-            depths = depths[mask]
-            p2Ds = p2Ds[mask]
-            variances = variances[mask]
-            # 用于权重计算
-            inv_uncert = 1 / variances.clip(1e-6, None)
-            p3Ds = np.array(p3Ds)[mask]
-            # 计算深度优化参数
-            m = param_multiplier * self.conf.rob_std
-            # 基于深度不确定性和深度值
-            params = m * variances ** 0.5 / depths
-            # 该权重反映深度误差的重要性
-            magnitudes = depths ** 2 * inv_uncert
-            # 添加深度束调整器 添加深度残差到优化问题
-            pycolmap.create_depth_bundle_adjuster(
-                problem,
-                imid,
-                p3Ds,
-                depths,
-                # 权重和鲁棒参数
-                magnitudes,
-                params,
-                # 默认 CAUCHY
-                depth_loss_type,
-                # 平移和尺度参数
-                shift_scale[imid],
-                self.mpsfm_rec.rec,
-                # 控制是否固定平移和尺度
-                fix_shift=True,
-                fix_scale=fix_scale,
-                logloss=True,
-            )
-            # 仅在尺度为自由变量时设置流形（shift 固定、scale 自由）
-            if not fix_scale:
-                problem.set_manifold(shift_scale[imid], pyceres.SubsetManifold(2, [0]))
+            if image.depth is not None and image.depth.activated:
+                # 处理深度数据（先添加残差，确保相关参数块已被注册）
+                p2Ds = np.array(image.get_observation_point2D_idxs())
+                kps_with3D = image.keypoint_coordinates(p2Ds)
+                valid = image.depth.valid_at_kps(kps_with3D)
+                kps_with3D = kps_with3D[valid]
+                if depth_type == "update":
+                    depths = image.depth.data_at_kps(kps_with3D)
+                else:
+                    depths = image.depth.data_prior_at_kps(kps_with3D)
+                p2Ds = p2Ds[valid]
+                p3Ds = image.point3D_ids(p2Ds)
+                _, _, _, depth3d, _ = self.mpsfm_rec.project_image_3d_points(imid, p3Ds)
+                mask = depths > 0
+                mask *= depth3d > 0
+                if allow_scale_filter and self.conf.scale_filter:
+                    div = depths / depth3d
+                    mask *= (div < scale_filter_factor) * (div > (1 / scale_filter_factor))
+                uncertainty_update = image.depth.uncertainty_update
+                variances = np.array([uncertainty_update[pt2D_id] for pt2D_id in p2Ds])
+                if gross_outliers and image.depth.activated:
+                    whitened = (
+                        np.abs(np.log(depths).clip(1e-6, None) - np.log(depth3d).clip(1e-6, None))
+                        / variances ** 0.5
+                    )
+                    mask *= whitened < 3
+                if np.sum(mask) == 0:
+                    print("No valid points for depth regularizing")
+                else:
+                    depths = depths[mask]
+                    p2Ds = p2Ds[mask]
+                    variances = variances[mask]
+                    inv_uncert = 1 / variances.clip(1e-6, None)
+                    p3Ds = np.array(p3Ds)[mask]
+                    m = param_multiplier * self.conf.rob_std
+                    params = m * variances ** 0.5 / depths
+                    magnitudes = depths ** 2 * inv_uncert
+                    pycolmap.create_depth_bundle_adjuster(
+                        problem,
+                        imid,
+                        p3Ds,
+                        depths,
+                        magnitudes,
+                        params,
+                        depth_loss_type,
+                        shift_scale[imid],
+                        self.mpsfm_rec.rec,
+                        fix_shift=True,
+                        fix_scale=fix_scale,
+                        logloss=True,
+                    )
+                    if not fix_scale:
+                        problem.set_manifold(shift_scale[imid], pyceres.SubsetManifold(2, [0]))
             # 在残差加入后再约束相机位姿（确保参数块已存在）
             should_fix_pose = (imid in fixed_pose_ids) or (ii == 0)
             if should_fix_pose:
@@ -280,7 +257,11 @@ class Optimizer(BaseClass):
                     and ((imid == bundle["ref_id"]) or (not single_rescale))  # 当前图像是参考图像或未启用单一尺度调整
             ):
                 # 计算其他优化图像的平均尺度map_scale；若没有“其他图像”，则跳过度量尺度过滤
-                other_scales = [self.mpsfm_rec.images[id].depth.scale for id in bundle["optim_ids"] if id != imid]
+                other_scales = [
+                    self.mpsfm_rec.images[id].depth.scale
+                    for id in bundle["optim_ids"]
+                    if id != imid and self.mpsfm_rec.images[id].depth is not None
+                ]
                 if len(other_scales) > 0:
                     # 计算scale（投影深度与观测深度的比率） 避免除零
                     scale = kwargs["projdepths"] / (kwargs["obsdepths"].clip(1e-6, None))
@@ -422,6 +403,8 @@ class Optimizer(BaseClass):
         # 前面流程和之前初始化各项参数万变不离其宗 根据函数名字理解即可
         for imid in imids:
             image = self.mpsfm_rec.images[imid]
+            if image.depth is None:
+                continue
             # 获取与 3D 点关联的 2D 关键点索引
             p2Ds = np.array(image.get_observation_point2D_idxs())
             kps_with3D = image.keypoint_coordinates(p2Ds)
@@ -446,6 +429,9 @@ class Optimizer(BaseClass):
             D3dunscaled.append(depth3d / image.depth.scale)
             # 深度不确定性的标准差
             dstds.append(variances ** 0.5)
+        if len(D) == 0:
+            self.truncation_multiplier = 1
+            return
         # 将所有图像的观测深度、投影深度和标准差合并为单一数组
         depths = np.concatenate(D)
         depth3ds = np.concatenate(D3d)

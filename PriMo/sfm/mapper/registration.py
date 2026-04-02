@@ -28,10 +28,13 @@ class MpsfmRegistration(BaseClass):
         "verbose": 0,
         "use_prior_poses": False,
         "pose_config_path": None,
+        "use_prior_pose_pairing": True,
         "ba_refine_prior_pose": True,
         "refine_init_prior_pose": True,
         "epipolar_refine_min_matches": 12,
         "epipolar_refine_max_iters": 300,
+        "epipolar_refine_loss": "soft_l1",
+        "epipolar_refine_f_scale": 1e-2,
         "refine_remaining_prior_pose": True,
         "prior_pose_refine_min_corrs": 24,
         "prior_pose_refine_max_iters": 150,
@@ -228,10 +231,14 @@ class MpsfmRegistration(BaseClass):
         stats_before = residual_stats(R_rel, t_rel)
 
         try:
+            refine_loss = str(getattr(self.conf, "epipolar_refine_loss", "soft_l1"))
+            refine_f_scale = float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2))
             result = least_squares(
                 residual,
                 np.zeros(6, dtype=np.float64),
-                method="lm",
+                method="trf",
+                loss=refine_loss,
+                f_scale=refine_f_scale,
                 max_nfev=self.conf.epipolar_refine_max_iters,
             )
         except Exception as exc:
@@ -269,6 +276,8 @@ class MpsfmRegistration(BaseClass):
             "residual_after_max": stats_after["abs_max"],
             "rot_diff_deg": rot_diff_deg,
             "trans_angle_deg": trans_angle,
+            "loss": refine_loss,
+            "f_scale": refine_f_scale,
             "nfev": int(result.nfev),
         }
 
@@ -310,12 +319,18 @@ class MpsfmRegistration(BaseClass):
     def _estimate_init_rescale(self, ref_imid, kps_ref, T_ref_cw, candidate_points):
         if len(candidate_points.get("xyz", [])) == 0:
             return 1.0
+        image_ref = self.mpsfm_rec.images[ref_imid]
+        if image_ref.depth is None:
+            return 1.0
         tri_world = np.vstack(candidate_points["xyz"])
         tri_cam = T_ref_cw * tri_world
         z = tri_cam[:, -1]
         mask = np.asarray(candidate_points["pt2d_id_1"], dtype=int)
         d = self.mpsfm_rec.images[ref_imid].depth.data_prior_at_kps(kps_ref[mask])
-        return np.median(z / d)
+        valid = np.isfinite(d) & (d > 0) & np.isfinite(z) & (z > 0)
+        if not np.any(valid):
+            return 1.0
+        return float(np.median(z[valid] / d[valid]))
 
     def _merge_candidate_points(self, points_lifted, points_triangulated):
         candidate_points = {}
@@ -1045,6 +1060,9 @@ class MpsfmRegistration(BaseClass):
     def _lift_points_to_3d(self, im_ref_id, image_ref, liftref_2d):
         """Lift 2D points to 3D space using depth maps and camera transformations."""
         xy = np.array(liftref_2d)
+        image_depth = self.mpsfm_rec.images[im_ref_id].depth
+        if (not self.conf.lifted_registration) or image_depth is None or xy.size == 0:
+            return np.zeros((len(xy), 3), dtype=np.float64)
         d = self.mpsfm_rec.images[im_ref_id].depth.data_at_kps(xy)[:, None]
         camera_ref = self.mpsfm_rec.rec.cameras[image_ref.camera_id]
         return image_ref.cam_from_world.inverse() * (
@@ -1054,10 +1072,13 @@ class MpsfmRegistration(BaseClass):
     def _lift_points_for_init(self, im_ref_id, liftref_2d, camera_ref, rescale=1):
         """Lift 2D points to 3D space using depth maps and camera transformations."""
         xy = np.array(liftref_2d)
-        d = self.mpsfm_rec.images[im_ref_id].depth.data_prior_at_kps(xy)[:, None]
+        image_depth = self.mpsfm_rec.images[im_ref_id].depth
+        if (not self.conf.lifted_registration) or image_depth is None or xy.size == 0:
+            return np.zeros((len(xy), 3), dtype=np.float64), np.zeros(len(xy), dtype=bool)
+        d = image_depth.data_prior_at_kps(xy)[:, None]
         if rescale != 1:
             d *= rescale
-        valid = self.mpsfm_rec.images[im_ref_id].depth.valid_at_kps(xy)
+        valid = image_depth.valid_at_kps(xy)
         return (np.concatenate([camera_ref.cam_from_img(xy), np.ones((xy.shape[0], 1))], -1) * d), valid
 
     def _process_2D3D_pairs(self, pair2D3D):

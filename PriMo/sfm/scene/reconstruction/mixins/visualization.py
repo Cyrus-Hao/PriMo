@@ -25,7 +25,11 @@ class VisualizationUtils:
         if fig is None:
             fig = viz_3d.init_figure()
 
-        cmaps = {imid: read_image(images_dir / self.images[imid].name) for imid in self.registered_images}
+        reg_imids = [imid for imid in self.registered_images if self.images[imid].depth is not None]
+        if len(reg_imids) == 0:
+            return fig
+
+        cmaps = {imid: read_image(images_dir / self.images[imid].name) for imid in reg_imids}
         cmaps = {
             imid: cv2.resize(
                 cmaps[imid],
@@ -38,7 +42,6 @@ class VisualizationUtils:
         }
 
         if len(m) > 0:
-            reg_imids = self.registered_images.keys()
             masks = {imid: np.ones(self.images[imid].depth.data.shape, dtype=bool) for imid in reg_imids}
             if "valid" in m:
                 masks = {imid: (masks[imid] * self.images[imid].depth.valid) for imid in reg_imids}
@@ -71,7 +74,8 @@ class VisualizationUtils:
         else:
             masks = {}
         shown_names = set()
-        for imid, image in self.registered_images.items():
+        for imid in reg_imids:
+            image = self.registered_images[imid]
             camera = self.cameras[image.camera_id]
             depth = self.images[imid].depth.data_prior if prior else self.images[imid].depth.data
 

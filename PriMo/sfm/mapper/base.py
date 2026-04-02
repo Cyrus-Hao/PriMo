@@ -33,6 +33,7 @@ class MpsfmMapper(BaseClass):
     default_conf = {
         "verbose": 0,
         "dataset": {},
+        "use_mono_priors": True,
         "colmap_options": colmap_options
         | {
             "filter_min_tri_angle": 0.001,
@@ -94,6 +95,9 @@ class MpsfmMapper(BaseClass):
         for extract in self.conf.extract:
             assert extract in valid_extracts, f"Invalid extract type {extract}. Must be one of {valid_extracts}"
 
+    def _use_mono_priors(self) -> bool:
+        return bool(getattr(self.conf, "use_mono_priors", True))
+
     def _propagate_conf(self):
         self.conf.reconstruction.colmap_options = self.conf.colmap_options
         self.conf.registration.colmap_options = self.conf.colmap_options
@@ -113,11 +117,18 @@ class MpsfmMapper(BaseClass):
         self.conf.next_view.verbose = self.conf.verbose
         self.conf.extractors.verbose = self.conf.verbose
 
-        if getattr(self.conf.registration, "use_prior_poses", False) and self.conf.registration.pose_config_path:
-            self.conf.extractors.pose_config_path = self.conf.registration.pose_config_path
-            self.conf.extractors.prior_pose_retrieval = True
-            if self.conf.pairs_type == "retrieval":
+        reg_conf = self.conf.registration
+        use_prior_poses = bool(getattr(reg_conf, "use_prior_poses", False) and reg_conf.pose_config_path)
+        use_prior_pose_pairing = bool(getattr(reg_conf, "use_prior_pose_pairing", True))
+
+        self.conf.extractors.pose_config_path = reg_conf.pose_config_path if use_prior_poses else None
+        self.conf.extractors.prior_pose_retrieval = bool(use_prior_poses and use_prior_pose_pairing)
+
+        if self.conf.pairs_type == "retrieval":
+            if self.conf.extractors.prior_pose_retrieval:
                 self.conf.extractors.retrieval = "prior_pose"
+            elif getattr(self.conf.extractors, "retrieval", None) == "prior_pose":
+                self.conf.extractors.retrieval = Extraction.default_conf["retrieval"]
 
     def _init(
         self,
@@ -152,10 +163,11 @@ class MpsfmMapper(BaseClass):
             self.extractor.extract_pairwise()
             self._write_sparse_correspondence_counts()
 
-            if "depth" in self.conf.matches_mode:
-                self.extractor.extract_normals()
-            else:
-                self.extractor.extract_mono()
+            if self._use_mono_priors():
+                if "depth" in self.conf.matches_mode:
+                    self.extractor.extract_normals()
+                else:
+                    self.extractor.extract_mono()
 
             if len(self.conf.masks) > 0:
                 self.extractor.extract_masks(self.conf.masks)
@@ -203,11 +215,12 @@ class MpsfmMapper(BaseClass):
         )
 
         if not setup_only:
-            self.mpsfm_rec.initialize_mono_maps(
-                extraction_obj=self.extractor,
-                sfm_output_dir=self.sfm_outputs_dir,
-                pairs_pth=self.extractor.sfm_pairs_path,
-            )
+            if self._use_mono_priors():
+                self.mpsfm_rec.initialize_mono_maps(
+                    extraction_obj=self.extractor,
+                    sfm_output_dir=self.sfm_outputs_dir,
+                    pairs_pth=self.extractor.sfm_pairs_path,
+                )
             self.mpsfm_rec.init_kps_info(extraction_obj=self.extractor)
 
     def _write_sparse_correspondence_counts(self):
@@ -241,7 +254,8 @@ class MpsfmMapper(BaseClass):
         for imid in init_pair:
             if self.mpsfm_rec.images[imid].has_pose:
                 self.deregister_image(imid)
-            self.mpsfm_rec.images[imid].depth.reset()
+            if self.mpsfm_rec.images[imid].depth is not None:
+                self.mpsfm_rec.images[imid].depth.reset()
 
     def at_success(self):
         """Called when registration is successful. This is used to update the state of the mapper"""
@@ -567,13 +581,14 @@ class MpsfmMapper(BaseClass):
         self.optimizer.calculate_point_covs(
             bundle
         )  # Here we want the P3d vars to include the depth info (even when clean covs???)
-        shift_scale, success = self.optimizer.optimize_prior_shiftscale(bundle)
-        if not success:
-            print(f"Failed to optimize global shift scale for {bundle['optim_ids']}")
-            return False
-        self.log(f"Shift scale: {shift_scale}", level=2)
-        self.mpsfm_rec.rescale_all(shift_scale)
-        self.mpsfm_rec.activate_depths(bundle["optim_ids"])
+        if self._use_mono_priors():
+            shift_scale, success = self.optimizer.optimize_prior_shiftscale(bundle)
+            if not success:
+                print(f"Failed to optimize global shift scale for {bundle['optim_ids']}")
+                return False
+            self.log(f"Shift scale: {shift_scale}", level=2)
+            self.mpsfm_rec.rescale_all(shift_scale)
+            self.mpsfm_rec.activate_depths(bundle["optim_ids"])
 
         if not self.optimizer.refine_3d_points(bundle):
             print(f"Failed to refine global 3d points for {bundle['optim_ids']}")
@@ -595,7 +610,7 @@ class MpsfmMapper(BaseClass):
             print(100 * "-")
         self.first_refinement = True
 
-        if self.mpsfm_rec.images[imid].depth.activated:
+        if self.mpsfm_rec.images[imid].depth is not None and self.mpsfm_rec.images[imid].depth.activated:
             self.mpsfm_rec.images[imid].depth.reset()
         local_bundle = self.find_local_bundle(imid)
         # before 3d poitns have been refined with depth, doesn't make sense to filter points with uncertainty
@@ -627,25 +642,26 @@ class MpsfmMapper(BaseClass):
         self.log("Calculating point covariances...", tstart=True, level=1)
         self.optimizer.calculate_point_covs(observed_bundle)
         self.log(tend=True, level=1)
-        self.log("Optimizing prior scale...", tstart=True, level=1)
-        shift_scale, success = self.optimizer.optimize_prior_shiftscale(local_bundle, allow_metric_scale_filter=True)
-        self.log(tend=True, level=1)
+        if self._use_mono_priors():
+            self.log("Optimizing prior scale...", tstart=True, level=1)
+            shift_scale, success = self.optimizer.optimize_prior_shiftscale(local_bundle, allow_metric_scale_filter=True)
+            self.log(tend=True, level=1)
 
-        if not success:
-            print(f"Failed to optimize shift scale for {local_bundle['optim_ids']}")
-            return False
-        self.mpsfm_rec.rescale_all(shift_scale)
-        self.mpsfm_rec.activate_depths(set([imid]))
-
-        self.log("Refining 3d points...", level=1)
-        if self.conf.integrate and (not self.integrate_bundle([imid], int_covs=self.conf.int_covs)):
-            print("Failed to integrate bundle")
-            return None, False
-
-        if self.conf.depth_consistency and check_depth_consistency:
-            bundle = self.find_local_bundle(imid, num_images=5, return_points=False)
-            if not self.depth_consistency_checker.check_image(imid, bundle):
+            if not success:
+                print(f"Failed to optimize shift scale for {local_bundle['optim_ids']}")
                 return False
+            self.mpsfm_rec.rescale_all(shift_scale)
+            self.mpsfm_rec.activate_depths(set([imid]))
+
+            self.log("Refining 3d points...", level=1)
+            if self.conf.integrate and (not self.integrate_bundle([imid], int_covs=self.conf.int_covs)):
+                print("Failed to integrate bundle")
+                return None, False
+
+            if self.conf.depth_consistency and check_depth_consistency:
+                bundle = self.find_local_bundle(imid, num_images=5, return_points=False)
+                if not self.depth_consistency_checker.check_image(imid, bundle):
+                    return False
         self.log("Refining 3d points...", tstart=True, level=1)
         if not self.optimizer.refine_3d_points(
             local_bundle, depth_type="prior" if not self.conf.integrate else "update"
@@ -688,7 +704,7 @@ class MpsfmMapper(BaseClass):
                 print("Failed to integrate bundle")
                 return None, False
             self.log(tend=True, level=1)
-        if mode == "global":
+        if mode == "global" and self._use_mono_priors():
             self.optimizer.update_truncation_multiplier(self.mpsfm_rec.reg_image_ids())
         self.log("\tAdjusting bunlde...", tstart=True, level=1)
         # 当使用 prior pose 时，仅对确有先验的图像固定位姿，避免影响无先验帧
@@ -831,6 +847,9 @@ class MpsfmMapper(BaseClass):
         collect_risky_p3d = []
         for imid in imids:
             image = self.mpsfm_rec.images[imid]
+            if image.depth is None:
+                collect_risky_p3d.append(set())
+                continue
             pt2D_ids = image.get_observation_point2D_idxs()
             kps_with3D = image.keypoint_coordinates(pt2D_ids)
             p3d_ids = np.array(image.point3D_ids(pt2D_ids))
@@ -847,8 +866,11 @@ class MpsfmMapper(BaseClass):
         """Filters 3D points in local bundle"""
         num_changed_observations = 0
 
-        collect_risky_p3d = self.find_invalid_depth_points(local_bundle["optim_ids"])
-        collect_risky_p3d = set.intersection(*collect_risky_p3d)
+        collect_risky_p3d = set()
+        if self._use_mono_priors():
+            risky_sets = self.find_invalid_depth_points(local_bundle["optim_ids"])
+            if risky_sets:
+                collect_risky_p3d = set.intersection(*risky_sets)
         pts3d = local_bundle["pts3D"]
         if "constpoints" in local_bundle:
             pts3d = pts3d.union(local_bundle["constpoints"])

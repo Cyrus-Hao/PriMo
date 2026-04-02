@@ -161,6 +161,8 @@ class MpsfmReconstruction(BaseClass, ColmapReconstructionWrapper, Reconstruction
     def cache_depths(self, priors_dir: Path):
         with h5py.File(priors_dir, "w") as f:
             for imid, image in self.registered_images.items():
+                if image.depth is None:
+                    continue
                 if image.depth.data is not None:
                     f.create_dataset(f"depths/{imid}", data=image.depth.data, compression="gzip")
                 if image.depth.continuity_mask is not None:

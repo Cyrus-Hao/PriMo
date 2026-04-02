@@ -1,0 +1,6 @@
+# H: G + PromptDA depth prior + BA freeze
+defaults:
+  - G
+
+registration:
+  ba_refine_prior_pose: false

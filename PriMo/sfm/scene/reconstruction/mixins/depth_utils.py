@@ -6,12 +6,22 @@ from mpsfm.utils.geometry import project3D, unproject_depth_map_to_world
 class DepthUtils:
     """Depth map utils mixin for reconstruction."""
 
+    def _get_image_depth(self, imid):
+        image = self.images.get(imid)
+        if image is None:
+            return None
+        return getattr(image, "depth", None)
+
     def reproject_depth(self, imid1, imid2, cfw1=None, cfw2=None):
         """Reprojects depth from imid1 to imid2"""
         image1 = self.images[imid1]
         image2 = self.images[imid2]
-        depth1 = self.images[imid1].depth.data
-        depth2_shape = self.images[imid2].depth.data_prior.shape
+        depth_obj1 = self._get_image_depth(imid1)
+        depth_obj2 = self._get_image_depth(imid2)
+        if depth_obj1 is None or depth_obj2 is None or depth_obj1.data is None or depth_obj2.data_prior is None:
+            return None
+        depth1 = depth_obj1.data.copy()
+        depth2_shape = depth_obj2.data_prior.shape
 
         cam1 = self.cameras[self.images[imid1].camera_id]
         cam2 = self.cameras[self.images[imid2].camera_id]
@@ -52,27 +62,36 @@ class DepthUtils:
     def activate_depths(self, imids):
         """Activates depths for images"""
         for imid in imids:
-            if not self.images[imid].depth.activated:
-                self.images[imid].depth.activated = True
-                self.images[imid].depth.data = self.images[imid].depth.data_prior.copy()
+            depth = self._get_image_depth(imid)
+            if depth is None:
+                continue
+            if not depth.activated:
+                depth.activated = True
+                depth.data = depth.data_prior.copy()
 
     def _rescale_prior(self, imid, shift, scale):
         """Rescales depth prior"""
-        self.images[imid].depth.data_prior = self.images[imid].depth.data_prior * scale + shift
-        self.images[imid].depth.scale *= scale
-        self.images[imid].depth.shift = self.images[imid].depth.shift * scale + shift
-        self.images[imid].depth.uncertainty *= scale**2
+        depth = self._get_image_depth(imid)
+        if depth is None:
+            return
+        depth.data_prior = depth.data_prior * scale + shift
+        depth.scale *= scale
+        depth.shift = depth.shift * scale + shift
+        depth.uncertainty *= scale**2
 
     def __rescale_update(self, imid, shift, scale, rescale_depth=False):
         """Rescales optimized depth"""
-        if rescale_depth and self.images[imid].depth.activated:
-            self.images[imid].depth.data = self.images[imid].depth.data * scale + shift
+        depth = self._get_image_depth(imid)
+        if depth is None:
+            return
+        if rescale_depth and depth.activated:
+            depth.data = depth.data * scale + shift
 
-        self.images[imid].depth.uncertainty_update *= scale**2
+        depth.uncertainty_update *= scale**2
         # 裁剪不确定性，避免多次重标定导致过度放大/缩小，引起深度项权重退化
-        uu = self.images[imid].depth.uncertainty_update
+        uu = depth.uncertainty_update
         # 在合理范围内裁剪（数值可根据数据集再调）
-        self.images[imid].depth.uncertainty_update = np.clip(uu, 1e-8, 1e4)
+        depth.uncertainty_update = np.clip(uu, 1e-8, 1e4)
 
     def rescale_all(self, shift_scales):
         """Rescales all depths i.e. priors and optimized depths"""

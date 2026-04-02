@@ -36,6 +36,5 @@ einops
 # DSINE
 geffnet
 
-# Dpro
--e ./third_party/ml-depth-pro
+
 

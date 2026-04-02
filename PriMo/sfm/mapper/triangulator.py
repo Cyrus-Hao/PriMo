@@ -62,13 +62,14 @@ class MpsfmTriangulator(BaseClass, ColmapTriangulatorWrapper):
 
                 self.mpsfm_rec.obs.delete_point3D(point3D_id)
                 for liftid, limid in enumerate(imids):
-                    if self.mpsfm_rec.images[limid].depth.activated:
+                    lift_depth = self.mpsfm_rec.images[limid].depth
+                    if lift_depth is not None and lift_depth.activated:
                         lift_image = self.mpsfm_rec.images[limid]
                         xy = np.array([self.mpsfm_rec.images[limid].points2D[ptids[liftid]].xy])
-                        valid = self.mpsfm_rec.images[limid].depth.valid_at_kps(xy)
+                        valid = lift_depth.valid_at_kps(xy)
                         if not valid[0]:
                             continue
-                        d = self.mpsfm_rec.images[limid].depth.data_at_kps(xy)[:, None]
+                        d = lift_depth.data_at_kps(xy)[:, None]
 
                         lift_camera = self.mpsfm_rec.rec.cameras[lift_image.camera_id]
                         xyz = lift_image.cam_from_world.inverse() * (
@@ -138,13 +139,14 @@ class MpsfmTriangulator(BaseClass, ColmapTriangulatorWrapper):
 
             self.mpsfm_rec.obs.delete_point3D(point3D_id)
             for liftid, imid in enumerate(imids):
-                if self.mpsfm_rec.images[imid].depth.activated:
+                lift_depth = self.mpsfm_rec.images[imid].depth
+                if lift_depth is not None and lift_depth.activated:
                     lift_image = self.mpsfm_rec.images[imid]
                     xy = np.array([self.mpsfm_rec.images[imid].points2D[ptids[liftid]].xy])
-                    valid = self.mpsfm_rec.images[imid].depth.valid_at_kps(xy)
+                    valid = lift_depth.valid_at_kps(xy)
                     if not valid[0]:
                         continue
-                    d = self.mpsfm_rec.images[imid].depth.data_at_kps(xy)[:, None]
+                    d = lift_depth.data_at_kps(xy)[:, None]
 
                     lift_camera = self.mpsfm_rec.rec.cameras[lift_image.camera_id]
                     xyz = lift_image.cam_from_world.inverse() * (

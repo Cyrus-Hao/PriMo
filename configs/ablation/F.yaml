@@ -1,0 +1,21 @@
+# F: E + Metric3Dv2 depth prior + BA refine
+defaults:
+  - E
+
+use_mono_priors: true
+integrate: true
+depth_consistency: true
+depth_consistency_init: false
+masks:
+  - sky
+
+ba:
+  depth_loss_name: "cauchy"
+  ref3d_loss_name: "trivial"
+  reproj_loss_name: "SOFT_L1"
+  reproj_loss_scale: 1.5
+  scale_filter: true
+  gross_outliers: false
+
+registration:
+  lifted_registration: true

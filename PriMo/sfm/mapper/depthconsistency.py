@@ -61,8 +61,12 @@ class DepthConsistencyChecker(BaseClass):
 
     def check_depth_consistency(self, imid1, imid2, c=15, score_thresh=None):
         """Check depth consistency between two images."""
+        if self.mpsfm_rec.images[imid1].depth is None or self.mpsfm_rec.images[imid2].depth is None:
+            return True
         out = self.mpsfm_rec.reproject_depth(imid1, imid2)
         out21 = self.mpsfm_rec.reproject_depth(imid2, imid1)
+        if out is None or out21 is None:
+            return True
         out |= {
             rev_key: out21[key]
             for key, rev_key in zip(

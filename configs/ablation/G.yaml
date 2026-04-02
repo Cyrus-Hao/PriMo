@@ -1,0 +1,7 @@
+# G: E + PromptDA depth prior + BA refine
+defaults:
+  - ../defaults/promptda
+  - E
+
+registration:
+  ba_refine_prior_pose: true

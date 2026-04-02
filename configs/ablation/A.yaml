@@ -1,0 +1,30 @@
+# A: NetVLAD retrieval + no init refine + no reg refine
+defaults:
+  - ../sp-lg_m3dv2
+
+use_mono_priors: false
+integrate: false
+depth_consistency: false
+depth_consistency_init: false
+int_covs: false
+int_covs_every_iter: false
+masks: []
+pre_fail: false
+dc_all_frames: false
+
+ba:
+  depth_loss_name: "trivial"
+  ref3d_loss_name: "trivial"
+  reproj_loss_name: "SOFT_L1"
+  reproj_loss_scale: 1.0
+  scale_filter: false
+  gross_outliers: false
+
+registration:
+  lifted_registration: false
+  use_prior_poses: true
+  pose_config_path: "/root/autodl-tmp/PriMo/local/example/camera_poses.yaml"
+  use_prior_pose_pairing: false
+  refine_init_prior_pose: false
+  refine_remaining_prior_pose: false
+  ba_refine_prior_pose: true

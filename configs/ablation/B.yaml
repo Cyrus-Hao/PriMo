@@ -1,0 +1,6 @@
+# B: A + BA prior freeze
+defaults:
+  - A
+
+registration:
+  ba_refine_prior_pose: false
