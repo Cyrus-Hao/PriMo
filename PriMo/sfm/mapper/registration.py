@@ -35,6 +35,14 @@ class MpsfmRegistration(BaseClass):
         "epipolar_refine_max_iters": 300,
         "epipolar_refine_loss": "soft_l1",
         "epipolar_refine_f_scale": 1e-2,
+        "init_joint_refine_reproj_thresh": 12.0,
+        "init_joint_refine_min_depth_matches": 8,
+        "init_joint_refine_reproj_weight": 1.0,
+        "init_joint_refine_rot_reg_weight": 1e-3,
+        "init_joint_refine_trans_reg_weight": 1e-3,
+        "init_joint_refine_scale_reg_weight": 1e-2,
+        "init_joint_refine_max_depth_scale": 5.0,
+        "init_joint_refine_require_improvement": True,
         "refine_remaining_prior_pose": True,
         "prior_pose_refine_min_corrs": 24,
         "prior_pose_refine_max_iters": 150,
@@ -181,110 +189,216 @@ class MpsfmRegistration(BaseClass):
         denom = Ex1[:, 0] ** 2 + Ex1[:, 1] ** 2 + Etx2[:, 0] ** 2 + Etx2[:, 1] ** 2 + 1e-12
         return numerators / np.sqrt(denom)
 
-    def _refine_init_pair_pose_epipolar(
+    def _refine_init_pair_pose_joint(
         self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
     ):
         if not self.conf.refine_init_prior_pose:
-            return T_c2w, False, {}
+            return T_c2w, 1.0, False, {}
         matches = np.asarray(matches)
         min_matches = self.conf.epipolar_refine_min_matches
         if len(matches) < min_matches:
-            return T_c2w, False, {}
+            return T_c2w, 1.0, False, {}
 
         pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
         pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
         if len(pts1) < min_matches:
-            return T_c2w, False, {}
+            return T_c2w, 1.0, False, {}
 
         R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
         baseline_norm = float(np.linalg.norm(t_rel))
         if baseline_norm < 1e-9:
-            return T_c2w, False, {}
-        t_rel = self._normalize_translation(t_rel)
+            return T_c2w, 1.0, False, {}
+        t_rel_unit = self._normalize_translation(t_rel)
 
-        def residual(delta):
-            R_curr, t_curr = self._compose_left_se3_delta(R_rel, t_rel, delta)
-            t_curr = self._normalize_translation(t_curr)
-            return self._epipolar_residuals(R_curr, t_curr, pts1, pts2)
+        refine_loss = str(getattr(self.conf, "epipolar_refine_loss", "soft_l1"))
+        epipolar_scale = max(float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2)), 1e-6)
+        reproj_thresh = max(
+            float(
+                getattr(
+                    self.conf,
+                    "init_joint_refine_reproj_thresh",
+                    getattr(self.conf, "prior_pose_refine_reproj_thresh", 12.0),
+                )
+            ),
+            1e-6,
+        )
+        reproj_weight = max(float(getattr(self.conf, "init_joint_refine_reproj_weight", 1.0)), 0.0)
+        rot_reg_weight = max(float(getattr(self.conf, "init_joint_refine_rot_reg_weight", 1e-3)), 0.0)
+        trans_reg_weight = max(float(getattr(self.conf, "init_joint_refine_trans_reg_weight", 1e-3)), 0.0)
+        scale_reg_weight = max(float(getattr(self.conf, "init_joint_refine_scale_reg_weight", 1e-2)), 0.0)
+        min_depth_matches = int(getattr(self.conf, "init_joint_refine_min_depth_matches", 8))
+        max_depth_scale = max(float(getattr(self.conf, "init_joint_refine_max_depth_scale", 5.0)), 1.0 + 1e-6)
+        require_improvement = bool(getattr(self.conf, "init_joint_refine_require_improvement", True))
 
-        def residual_stats(R_mat, t_vec):
-            res = self._epipolar_residuals(R_mat, t_vec, pts1, pts2)
-            if len(res) == 0:
-                return {
-                    "count": 0,
-                    "rms": 0.0,
-                    "abs_mean": 0.0,
-                    "abs_median": 0.0,
-                    "abs_p95": 0.0,
-                    "abs_max": 0.0,
-                }
-            abs_res = np.abs(res)
+        ref_pts2d = kps1[matches[:, 0]]
+        qry_pts2d = kps2[matches[:, 1]]
+        lifted_cam_raw, lifted_valid = self._lift_points_for_init(ref_imid, ref_pts2d, camera1, rescale=1.0)
+        lifted_valid = np.asarray(lifted_valid, dtype=bool)
+        lifted_finite = np.isfinite(lifted_cam_raw).all(axis=1)
+        lifted_positive = lifted_cam_raw[:, 2] > 1e-9 if lifted_cam_raw.size else np.zeros(0, dtype=bool)
+        depth_mask = lifted_valid & lifted_finite & lifted_positive
+        use_depth = int(np.count_nonzero(depth_mask)) >= min_depth_matches
+        lifted_cam = lifted_cam_raw[depth_mask] if use_depth else np.zeros((0, 3), dtype=np.float64)
+        lifted_qry_pts2d = qry_pts2d[depth_mask] if use_depth else np.zeros((0, 2), dtype=np.float64)
+
+        def _compose_state(state):
+            delta = state[:6]
+            R_curr, t_curr = self._compose_left_se3_delta(R_rel, t_rel_unit, delta)
+            t_curr_unit = self._normalize_translation(t_curr)
+            if np.linalg.norm(t_curr_unit) < 1e-9:
+                t_curr_unit = t_rel_unit.copy()
+            t_curr_abs = t_curr_unit * baseline_norm
+            depth_scale = float(np.exp(state[6])) if use_depth else 1.0
+            return delta, R_curr, t_curr_unit, t_curr_abs, depth_scale
+
+        def _depth_reproj(R_mat, t_abs, depth_scale):
+            if not use_depth:
+                return np.zeros((0, 2), dtype=np.float64), np.zeros(0, dtype=bool)
+            xyz_ref = lifted_cam * depth_scale
+            xyz_qry = (R_mat @ xyz_ref.T).T + t_abs[None]
+            residual = np.full((len(xyz_ref), 2), reproj_thresh * 5.0, dtype=np.float64)
+            valid = xyz_qry[:, 2] > 1e-9
+            if np.any(valid):
+                proj = camera2.img_from_cam(xyz_qry[valid])
+                residual[valid] = proj - lifted_qry_pts2d[valid]
+            return residual, valid
+
+        def _state_stats(state):
+            delta, R_mat, t_unit, t_abs, depth_scale = _compose_state(state)
+            epi_raw = self._epipolar_residuals(R_mat, t_unit, pts1, pts2)
+            epi_block = epi_raw / epipolar_scale
+            blocks = [epi_block]
+
+            depth_raw, depth_valid = _depth_reproj(R_mat, t_abs, depth_scale)
+            if use_depth and reproj_weight > 0:
+                blocks.append(np.sqrt(reproj_weight) * (depth_raw.reshape(-1) / reproj_thresh))
+
+            reg_blocks = []
+            if rot_reg_weight > 0:
+                reg_blocks.append(np.sqrt(rot_reg_weight) * delta[:3])
+            if trans_reg_weight > 0:
+                reg_blocks.append(np.sqrt(trans_reg_weight) * delta[3:])
+            if use_depth and scale_reg_weight > 0:
+                reg_blocks.append(np.array([np.sqrt(scale_reg_weight) * np.log(depth_scale)], dtype=np.float64))
+            if reg_blocks:
+                blocks.extend(reg_blocks)
+
+            joint = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
+
+            epi_abs = np.abs(epi_raw)
+            depth_norm = np.linalg.norm(depth_raw, axis=1) if len(depth_raw) else np.zeros(0, dtype=np.float64)
+            depth_inliers = (
+                int(np.count_nonzero(depth_valid & (depth_norm <= reproj_thresh))) if len(depth_norm) else 0
+            )
             return {
-                "count": int(len(res)),
-                "rms": float(np.sqrt(np.mean(res**2))),
-                "abs_mean": float(np.mean(abs_res)),
-                "abs_median": float(np.median(abs_res)),
-                "abs_p95": float(np.percentile(abs_res, 95)),
-                "abs_max": float(np.max(abs_res)),
+                "joint": joint,
+                "R": R_mat,
+                "t_unit": t_unit,
+                "t_abs": t_abs,
+                "depth_scale": depth_scale,
+                "epi_count": int(len(epi_raw)),
+                "epi_rms": float(np.sqrt(np.mean(epi_raw**2))) if len(epi_raw) else 0.0,
+                "epi_p95": float(np.percentile(epi_abs, 95)) if len(epi_abs) else 0.0,
+                "joint_rms": float(np.sqrt(np.mean(joint**2))) if len(joint) else 0.0,
+                "depth_rms": float(np.sqrt(np.mean(depth_norm**2))) if len(depth_norm) else 0.0,
+                "depth_p95": float(np.percentile(depth_norm, 95)) if len(depth_norm) else 0.0,
+                "depth_valid": int(np.count_nonzero(depth_valid)),
+                "depth_inliers": depth_inliers,
+                "num_depth_matches": int(len(depth_norm)),
             }
 
-        stats_before = residual_stats(R_rel, t_rel)
+        def residual(state):
+            return _state_stats(state)["joint"]
+
+        x0 = np.zeros(7 if use_depth else 6, dtype=np.float64)
+        lower = np.full_like(x0, -np.inf)
+        upper = np.full_like(x0, np.inf)
+        if use_depth:
+            log_bound = float(np.log(max_depth_scale))
+            lower[6] = -log_bound
+            upper[6] = log_bound
+
+        stats_before = _state_stats(x0)
 
         try:
-            refine_loss = str(getattr(self.conf, "epipolar_refine_loss", "soft_l1"))
-            refine_f_scale = float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2))
             result = least_squares(
                 residual,
-                np.zeros(6, dtype=np.float64),
+                x0,
                 method="trf",
                 loss=refine_loss,
-                f_scale=refine_f_scale,
+                f_scale=1.0,
+                bounds=(lower, upper),
                 max_nfev=self.conf.epipolar_refine_max_iters,
             )
         except Exception as exc:
-            self.log(f"[InitPair] Epipolar refine failed: {exc}", level=1)
-            return T_c2w, False, {}
+            self.log(f"[InitPair] Joint refine failed: {exc}", level=1)
+            return T_c2w, 1.0, False, {}
 
         if not result.success:
-            return T_c2w, False, {}
+            return T_c2w, 1.0, False, {}
 
-        R_opt, t_opt = self._compose_left_se3_delta(R_rel, t_rel, result.x)
-        t_opt_unit = self._normalize_translation(t_opt)
-        stats_after = residual_stats(R_opt, t_opt_unit)
+        stats_after = _state_stats(result.x)
+        accept = True
+        if require_improvement:
+            improved_joint = stats_after["joint_rms"] <= (stats_before["joint_rms"] + 1e-8)
+            improved_epi = stats_after["epi_rms"] <= (stats_before["epi_rms"] + 1e-8)
+            improved_depth = True
+            if use_depth:
+                improved_depth = (
+                    stats_after["depth_rms"] <= (stats_before["depth_rms"] + 1e-8)
+                    or stats_after["depth_inliers"] >= stats_before["depth_inliers"]
+                )
+            accept = improved_joint and improved_epi and improved_depth
+        if not accept:
+            return T_c2w, 1.0, False, {}
+
+        R_opt = stats_after["R"]
+        t_opt_unit = stats_after["t_unit"]
+        depth_scale = stats_after["depth_scale"]
 
         rot_delta = R_opt @ R_rel.T
         rot_diff = Rotation.from_matrix(rot_delta)
-        rot_diff_deg = float(np.rad2deg(rot_diff.magnitude()))
         trans_angle = float(
             np.rad2deg(
                 np.arccos(
                     np.clip(
-                        np.dot(t_rel, t_opt_unit) / (np.linalg.norm(t_rel) * np.linalg.norm(t_opt_unit)), -1.0, 1.0
+                        np.dot(t_rel_unit, t_opt_unit)
+                        / (np.linalg.norm(t_rel_unit) * np.linalg.norm(t_opt_unit)),
+                        -1.0,
+                        1.0,
                     )
                 )
             )
         )
 
         refine_stats = {
-            "num_matches": stats_before["count"],
+            "num_matches": stats_before["epi_count"],
             "baseline_norm": baseline_norm,
-            "residual_before_rms": stats_before["rms"],
-            "residual_before_p95": stats_before["abs_p95"],
-            "residual_before_max": stats_before["abs_max"],
-            "residual_after_rms": stats_after["rms"],
-            "residual_after_p95": stats_after["abs_p95"],
-            "residual_after_max": stats_after["abs_max"],
-            "rot_diff_deg": rot_diff_deg,
+            "used_depth": bool(use_depth),
+            "num_depth_matches": stats_after["num_depth_matches"],
+            "depth_scale": depth_scale,
+            "residual_before_rms": stats_before["epi_rms"],
+            "residual_before_p95": stats_before["epi_p95"],
+            "residual_after_rms": stats_after["epi_rms"],
+            "residual_after_p95": stats_after["epi_p95"],
+            "joint_before_rms": stats_before["joint_rms"],
+            "joint_after_rms": stats_after["joint_rms"],
+            "depth_before_rms": stats_before["depth_rms"],
+            "depth_after_rms": stats_after["depth_rms"],
+            "depth_inliers_before": stats_before["depth_inliers"],
+            "depth_inliers_after": stats_after["depth_inliers"],
+            "rot_diff_deg": float(np.rad2deg(rot_diff.magnitude())),
             "trans_angle_deg": trans_angle,
             "loss": refine_loss,
-            "f_scale": refine_f_scale,
+            "epipolar_scale": epipolar_scale,
+            "reproj_thresh": reproj_thresh,
             "nfev": int(result.nfev),
         }
 
         refined_translation = t_opt_unit * baseline_norm
         refined_relative = pycolmap.Rigid3d(pycolmap.Rotation3d(R_opt), refined_translation)
         refined_pose = refined_relative * T_c1w
-        return refined_pose, True, refine_stats
+        return refined_pose, depth_scale, True, refine_stats
 
     @staticmethod
     def _candidate_points3D_for_init(
@@ -769,11 +883,24 @@ class MpsfmRegistration(BaseClass):
 
             if self.conf.refine_init_prior_pose:
                 refine_matches = matches_used if len(matches_used) > 0 else matches
-                T_c2w_refined, refined_ok, refine_stats = self._refine_init_pair_pose_epipolar(
+                T_c2w_refined, refined_rescale, refined_ok, refine_stats = self._refine_init_pair_pose_joint(
                     imid1, imid2, T_c1w, T_c2w, refine_matches, kps1, kps2, camera1, camera2
                 )
                 if refined_ok:
                     T_c2w = T_c2w_refined
+                    if refine_stats.get("used_depth", False):
+                        rescale = refined_rescale
+                    else:
+                        pts_tri_refined = self._candidate_points3D_for_init(
+                            T_c1w,
+                            T_c2w,
+                            matches_used,
+                            self.mpsfm_rec.images[imid1],
+                            self.mpsfm_rec.images[imid2],
+                            camera1,
+                            camera2,
+                        )
+                        rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_refined)
                     refined_mask = self._inlier_mask_for_pair_under_pose(
                         imid1,
                         imid2,
