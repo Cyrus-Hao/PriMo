@@ -186,6 +186,8 @@ class MpsfmReconstruction(BaseClass, ColmapReconstructionWrapper, Reconstruction
 
     def find_local_bundle_ids(self, refimid, num_images=None):
         """Finds local bundle ids"""
+        if refimid not in self.registered_images:
+            return []
         impl = pycolmap.IncrementalMapperImpl()
         confs = {
             k: v for k, v in self.conf.colmap_options.items() if k in {"local_ba_min_tri_angle", "local_ba_num_images"}

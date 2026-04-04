@@ -35,6 +35,38 @@ class MpsfmRegistration(BaseClass):
         "epipolar_refine_max_iters": 300,
         "epipolar_refine_loss": "soft_l1",
         "epipolar_refine_f_scale": 1e-2,
+        "init_soft_filter_min_weight": 0.05,
+        "init_refine_irls_iters": 3,
+        "init_refine_stage_a_max_rot_deg": 3.0,
+        "init_refine_stage_b_max_rot_deg": 5.0,
+        "init_refine_stage_b_max_trans_deg": 10.0,
+        "init_refine_rotation_reg_weight": 5e-3,
+        "init_refine_translation_reg_weight": 2e-3,
+        "init_core_inlier_residual_mult": 2.5,
+        "init_core_min_weight": 0.15,
+        "init_core_min_matches": 12,
+        "init_core_min_tri_angle": 0.1,
+        "init_support_inlier_residual_mult": 4.0,
+        "init_support_min_weight": 0.05,
+        "init_support_min_matches": 24,
+        "init_support_min_tri_angle": 0.03,
+        "init_spatial_reweight": True,
+        "init_spatial_grid_rows": 4,
+        "init_spatial_grid_cols": 4,
+        "init_spatial_reweight_power": 0.5,
+        "init_spatial_reweight_min": 0.35,
+        "init_spatial_reweight_max": 2.5,
+        "init_pseudo_inlier_residual_mult": 2.5,
+        "init_pseudo_inlier_min_weight": 0.15,
+        "init_pseudo_inlier_min_matches": 12,
+        "init_pseudo_min_tri_angle": 0.1,
+        "init_reproj_refine_min_points": 8,
+        "init_reproj_refine_max_iters": 60,
+        "init_reproj_refine_thresh": 4.0,
+        "init_reproj_refine_max_rot_deg": 1.5,
+        "init_reproj_refine_max_trans_deg": 3.0,
+        "init_reproj_refine_rot_reg_weight": 1e-3,
+        "init_reproj_refine_trans_reg_weight": 1e-3,
         "init_joint_refine_reproj_thresh": 12.0,
         "init_joint_refine_min_depth_matches": 8,
         "init_joint_refine_reproj_weight": 1.0,
@@ -42,6 +74,9 @@ class MpsfmRegistration(BaseClass):
         "init_joint_refine_trans_reg_weight": 1e-3,
         "init_joint_refine_scale_reg_weight": 1e-2,
         "init_joint_refine_max_depth_scale": 5.0,
+        "init_joint_refine_max_rot_change_deg": 4.0,
+        "init_joint_refine_max_trans_change_deg": 6.0,
+        "init_joint_refine_max_scale_change_ratio": 1.5,
         "init_joint_refine_require_improvement": True,
         "refine_remaining_prior_pose": True,
         "prior_pose_refine_min_corrs": 24,
@@ -189,216 +224,555 @@ class MpsfmRegistration(BaseClass):
         denom = Ex1[:, 0] ** 2 + Ex1[:, 1] ** 2 + Etx2[:, 0] ** 2 + Etx2[:, 1] ** 2 + 1e-12
         return numerators / np.sqrt(denom)
 
-    def _refine_init_pair_pose_joint(
+    @staticmethod
+    def _robust_residual_scale(residuals, floor):
+        residuals = np.abs(np.asarray(residuals, dtype=np.float64))
+        if residuals.size == 0:
+            return max(float(floor), 1e-6)
+        med = float(np.median(residuals))
+        mad = float(np.median(np.abs(residuals - med)))
+        return max(float(floor), 1.4826 * mad, 1e-6)
+
+    @staticmethod
+    def _cauchy_soft_weights(residuals, scale, floor=0.0):
+        scale = max(float(scale), 1e-6)
+        normalized = np.asarray(residuals, dtype=np.float64) / scale
+        weights = 1.0 / (1.0 + normalized**2)
+        if floor > 0:
+            weights = np.clip(weights, floor, 1.0)
+        return weights
+
+    @staticmethod
+    def _tangent_basis(unit_vec):
+        unit_vec = np.asarray(unit_vec, dtype=np.float64)
+        unit_vec = unit_vec / max(np.linalg.norm(unit_vec), 1e-12)
+        anchor = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(np.dot(unit_vec, anchor)) > 0.9:
+            anchor = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        basis1 = np.cross(unit_vec, anchor)
+        basis1 /= max(np.linalg.norm(basis1), 1e-12)
+        basis2 = np.cross(unit_vec, basis1)
+        basis2 /= max(np.linalg.norm(basis2), 1e-12)
+        return basis1, basis2
+
+    @staticmethod
+    def _grid_cell_weights(points, all_points, rows, cols, power):
+        if len(points) == 0:
+            return np.zeros(0, dtype=np.float64)
+        all_points = np.asarray(all_points, dtype=np.float64)
+        points = np.asarray(points, dtype=np.float64)
+        min_xy = np.min(all_points, axis=0)
+        max_xy = np.max(all_points, axis=0)
+        span = np.maximum(max_xy - min_xy, 1e-6)
+        x_ids = np.clip(((points[:, 0] - min_xy[0]) / span[0] * cols).astype(int), 0, cols - 1)
+        y_ids = np.clip(((points[:, 1] - min_xy[1]) / span[1] * rows).astype(int), 0, rows - 1)
+        cell_ids = y_ids * cols + x_ids
+        counts = np.bincount(cell_ids, minlength=rows * cols).astype(np.float64)
+        return 1.0 / np.maximum(counts[cell_ids], 1.0) ** power
+
+    def _refine_init_pair_pose_bootstrap(
         self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
     ):
         if not self.conf.refine_init_prior_pose:
-            return T_c2w, 1.0, False, {}
+            return T_c2w, np.zeros(0, dtype=bool), np.zeros(0, dtype=bool), False, {}
         matches = np.asarray(matches)
         min_matches = self.conf.epipolar_refine_min_matches
         if len(matches) < min_matches:
-            return T_c2w, 1.0, False, {}
+            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
 
         pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
         pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
         if len(pts1) < min_matches:
-            return T_c2w, 1.0, False, {}
+            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
 
         R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
         baseline_norm = float(np.linalg.norm(t_rel))
         if baseline_norm < 1e-9:
-            return T_c2w, 1.0, False, {}
+            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
         t_rel_unit = self._normalize_translation(t_rel)
 
-        refine_loss = str(getattr(self.conf, "epipolar_refine_loss", "soft_l1"))
         epipolar_scale = max(float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2)), 1e-6)
-        reproj_thresh = max(
-            float(
-                getattr(
-                    self.conf,
-                    "init_joint_refine_reproj_thresh",
-                    getattr(self.conf, "prior_pose_refine_reproj_thresh", 12.0),
-                )
-            ),
-            1e-6,
+        soft_floor = max(float(getattr(self.conf, "init_soft_filter_min_weight", 0.05)), 0.0)
+        irls_iters = max(int(getattr(self.conf, "init_refine_irls_iters", 3)), 1)
+        rot_reg_weight = max(float(getattr(self.conf, "init_refine_rotation_reg_weight", 5e-3)), 0.0)
+        trans_reg_weight = max(float(getattr(self.conf, "init_refine_translation_reg_weight", 2e-3)), 0.0)
+        stage_a_max_rot = np.deg2rad(max(float(getattr(self.conf, "init_refine_stage_a_max_rot_deg", 3.0)), 0.1))
+        stage_b_max_trans = np.deg2rad(max(float(getattr(self.conf, "init_refine_stage_b_max_trans_deg", 10.0)), 0.1))
+        core_weight_min = max(float(getattr(self.conf, "init_core_min_weight", 0.15)), 0.0)
+        core_res_mult = max(float(getattr(self.conf, "init_core_inlier_residual_mult", 2.5)), 1.0)
+        core_min_matches = max(int(getattr(self.conf, "init_core_min_matches", 12)), 3)
+        core_min_tri_angle = float(getattr(self.conf, "init_core_min_tri_angle", 0.1))
+        support_weight_min = max(float(getattr(self.conf, "init_support_min_weight", 0.05)), 0.0)
+        support_res_mult = max(float(getattr(self.conf, "init_support_inlier_residual_mult", 4.0)), core_res_mult)
+        support_min_matches = max(int(getattr(self.conf, "init_support_min_matches", 24)), core_min_matches)
+        support_min_tri_angle = float(getattr(self.conf, "init_support_min_tri_angle", 0.03))
+        reproj_min_points = max(int(getattr(self.conf, "init_reproj_refine_min_points", 8)), 3)
+        reproj_thresh = max(float(getattr(self.conf, "init_reproj_refine_thresh", 4.0)), 1e-6)
+        reproj_iters = max(int(getattr(self.conf, "init_reproj_refine_max_iters", 60)), 1)
+        reproj_rot_reg = max(float(getattr(self.conf, "init_reproj_refine_rot_reg_weight", 1e-3)), 0.0)
+        reproj_trans_reg = max(float(getattr(self.conf, "init_reproj_refine_trans_reg_weight", 1e-3)), 0.0)
+        reproj_max_rot = np.deg2rad(max(float(getattr(self.conf, "init_reproj_refine_max_rot_deg", 1.5)), 0.1))
+        reproj_max_trans = np.deg2rad(max(float(getattr(self.conf, "init_reproj_refine_max_trans_deg", 3.0)), 0.1))
+        joint_max_rot_change_deg = max(float(getattr(self.conf, "init_joint_refine_max_rot_change_deg", 4.0)), 0.0)
+        joint_max_trans_change_deg = max(
+            float(getattr(self.conf, "init_joint_refine_max_trans_change_deg", 6.0)), 0.0
         )
-        reproj_weight = max(float(getattr(self.conf, "init_joint_refine_reproj_weight", 1.0)), 0.0)
-        rot_reg_weight = max(float(getattr(self.conf, "init_joint_refine_rot_reg_weight", 1e-3)), 0.0)
-        trans_reg_weight = max(float(getattr(self.conf, "init_joint_refine_trans_reg_weight", 1e-3)), 0.0)
-        scale_reg_weight = max(float(getattr(self.conf, "init_joint_refine_scale_reg_weight", 1e-2)), 0.0)
-        min_depth_matches = int(getattr(self.conf, "init_joint_refine_min_depth_matches", 8))
-        max_depth_scale = max(float(getattr(self.conf, "init_joint_refine_max_depth_scale", 5.0)), 1.0 + 1e-6)
+        joint_max_scale_change_ratio = max(
+            float(getattr(self.conf, "init_joint_refine_max_scale_change_ratio", 1.5)), 1.0
+        )
         require_improvement = bool(getattr(self.conf, "init_joint_refine_require_improvement", True))
+        use_spatial_reweight = bool(getattr(self.conf, "init_spatial_reweight", True))
+        spatial_rows = max(int(getattr(self.conf, "init_spatial_grid_rows", 4)), 1)
+        spatial_cols = max(int(getattr(self.conf, "init_spatial_grid_cols", 4)), 1)
+        spatial_power = max(float(getattr(self.conf, "init_spatial_reweight_power", 0.5)), 0.0)
+        spatial_min = max(float(getattr(self.conf, "init_spatial_reweight_min", 0.35)), 0.0)
+        spatial_max = max(float(getattr(self.conf, "init_spatial_reweight_max", 2.5)), 1.0)
 
-        ref_pts2d = kps1[matches[:, 0]]
-        qry_pts2d = kps2[matches[:, 1]]
-        lifted_cam_raw, lifted_valid = self._lift_points_for_init(ref_imid, ref_pts2d, camera1, rescale=1.0)
-        lifted_valid = np.asarray(lifted_valid, dtype=bool)
-        lifted_finite = np.isfinite(lifted_cam_raw).all(axis=1)
-        lifted_positive = lifted_cam_raw[:, 2] > 1e-9 if lifted_cam_raw.size else np.zeros(0, dtype=bool)
-        depth_mask = lifted_valid & lifted_finite & lifted_positive
-        use_depth = int(np.count_nonzero(depth_mask)) >= min_depth_matches
-        lifted_cam = lifted_cam_raw[depth_mask] if use_depth else np.zeros((0, 3), dtype=np.float64)
-        lifted_qry_pts2d = qry_pts2d[depth_mask] if use_depth else np.zeros((0, 2), dtype=np.float64)
+        def _compose_relative(R_base, t_base_unit, rot_state, dir_state=None):
+            R_curr = Rotation.from_rotvec(rot_state).as_matrix() @ R_base
+            if dir_state is None:
+                return R_curr, t_base_unit.copy()
+            basis1, basis2 = self._tangent_basis(t_base_unit)
+            t_curr = t_base_unit + dir_state[0] * basis1 + dir_state[1] * basis2
+            t_curr = self._normalize_translation(t_curr)
+            if np.linalg.norm(t_curr) < 1e-9:
+                t_curr = t_base_unit.copy()
+            return R_curr, t_curr
 
-        def _compose_state(state):
-            delta = state[:6]
-            R_curr, t_curr = self._compose_left_se3_delta(R_rel, t_rel_unit, delta)
-            t_curr_unit = self._normalize_translation(t_curr)
-            if np.linalg.norm(t_curr_unit) < 1e-9:
-                t_curr_unit = t_rel_unit.copy()
-            t_curr_abs = t_curr_unit * baseline_norm
-            depth_scale = float(np.exp(state[6])) if use_depth else 1.0
-            return delta, R_curr, t_curr_unit, t_curr_abs, depth_scale
+        def _relative_to_absolute(R_curr, t_curr_unit):
+            refined_translation = t_curr_unit * baseline_norm
+            refined_relative = pycolmap.Rigid3d(pycolmap.Rotation3d(R_curr), refined_translation)
+            return refined_relative * T_c1w
 
-        def _depth_reproj(R_mat, t_abs, depth_scale):
-            if not use_depth:
-                return np.zeros((0, 2), dtype=np.float64), np.zeros(0, dtype=bool)
-            xyz_ref = lifted_cam * depth_scale
-            xyz_qry = (R_mat @ xyz_ref.T).T + t_abs[None]
-            residual = np.full((len(xyz_ref), 2), reproj_thresh * 5.0, dtype=np.float64)
-            valid = xyz_qry[:, 2] > 1e-9
-            if np.any(valid):
-                proj = camera2.img_from_cam(xyz_qry[valid])
-                residual[valid] = proj - lifted_qry_pts2d[valid]
-            return residual, valid
-
-        def _state_stats(state):
-            delta, R_mat, t_unit, t_abs, depth_scale = _compose_state(state)
-            epi_raw = self._epipolar_residuals(R_mat, t_unit, pts1, pts2)
-            epi_block = epi_raw / epipolar_scale
-            blocks = [epi_block]
-
-            depth_raw, depth_valid = _depth_reproj(R_mat, t_abs, depth_scale)
-            if use_depth and reproj_weight > 0:
-                blocks.append(np.sqrt(reproj_weight) * (depth_raw.reshape(-1) / reproj_thresh))
-
-            reg_blocks = []
-            if rot_reg_weight > 0:
-                reg_blocks.append(np.sqrt(rot_reg_weight) * delta[:3])
-            if trans_reg_weight > 0:
-                reg_blocks.append(np.sqrt(trans_reg_weight) * delta[3:])
-            if use_depth and scale_reg_weight > 0:
-                reg_blocks.append(np.array([np.sqrt(scale_reg_weight) * np.log(depth_scale)], dtype=np.float64))
-            if reg_blocks:
-                blocks.extend(reg_blocks)
-
-            joint = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
-
-            epi_abs = np.abs(epi_raw)
-            depth_norm = np.linalg.norm(depth_raw, axis=1) if len(depth_raw) else np.zeros(0, dtype=np.float64)
-            depth_inliers = (
-                int(np.count_nonzero(depth_valid & (depth_norm <= reproj_thresh))) if len(depth_norm) else 0
+        def _estimate_scale_for_pose(T_qry_cw, match_mask):
+            if match_mask is None:
+                return 1.0, 0
+            match_mask = np.asarray(match_mask, dtype=bool)
+            if match_mask.size != len(matches) or int(np.count_nonzero(match_mask)) < 3:
+                return 1.0, 0
+            candidate_points = self._candidate_points3D_for_init(
+                T_c1w,
+                T_qry_cw,
+                matches[match_mask],
+                self.mpsfm_rec.images[ref_imid],
+                self.mpsfm_rec.images[qry_imid],
+                camera1,
+                camera2,
             )
-            return {
-                "joint": joint,
-                "R": R_mat,
-                "t_unit": t_unit,
-                "t_abs": t_abs,
-                "depth_scale": depth_scale,
-                "epi_count": int(len(epi_raw)),
-                "epi_rms": float(np.sqrt(np.mean(epi_raw**2))) if len(epi_raw) else 0.0,
-                "epi_p95": float(np.percentile(epi_abs, 95)) if len(epi_abs) else 0.0,
-                "joint_rms": float(np.sqrt(np.mean(joint**2))) if len(joint) else 0.0,
-                "depth_rms": float(np.sqrt(np.mean(depth_norm**2))) if len(depth_norm) else 0.0,
-                "depth_p95": float(np.percentile(depth_norm, 95)) if len(depth_norm) else 0.0,
-                "depth_valid": int(np.count_nonzero(depth_valid)),
-                "depth_inliers": depth_inliers,
-                "num_depth_matches": int(len(depth_norm)),
-            }
+            scale_value = self._estimate_init_rescale(ref_imid, kps1, T_c1w, candidate_points)
+            return float(scale_value), int(len(candidate_points.get("xyz", [])))
 
-        def residual(state):
-            return _state_stats(state)["joint"]
+        def _run_stage_a(weights):
+            sqrt_w = np.sqrt(np.asarray(weights, dtype=np.float64))
 
-        x0 = np.zeros(7 if use_depth else 6, dtype=np.float64)
-        lower = np.full_like(x0, -np.inf)
-        upper = np.full_like(x0, np.inf)
-        if use_depth:
-            log_bound = float(np.log(max_depth_scale))
-            lower[6] = -log_bound
-            upper[6] = log_bound
+            def residual(rot_state):
+                R_curr, t_curr_unit = _compose_relative(R_rel, t_rel_unit, rot_state)
+                epi_raw = self._epipolar_residuals(R_curr, t_curr_unit, pts1, pts2)
+                blocks = [sqrt_w * (epi_raw / epipolar_scale)]
+                if rot_reg_weight > 0:
+                    blocks.append(np.sqrt(rot_reg_weight) * rot_state)
+                return np.concatenate(blocks)
 
-        stats_before = _state_stats(x0)
-
-        try:
-            result = least_squares(
+            bounds = (
+                np.full(3, -stage_a_max_rot, dtype=np.float64),
+                np.full(3, stage_a_max_rot, dtype=np.float64),
+            )
+            return least_squares(
                 residual,
-                x0,
+                np.zeros(3, dtype=np.float64),
                 method="trf",
-                loss=refine_loss,
-                f_scale=1.0,
-                bounds=(lower, upper),
+                loss="linear",
+                bounds=bounds,
                 max_nfev=self.conf.epipolar_refine_max_iters,
             )
-        except Exception as exc:
-            self.log(f"[InitPair] Joint refine failed: {exc}", level=1)
-            return T_c2w, 1.0, False, {}
 
-        if not result.success:
-            return T_c2w, 1.0, False, {}
-
-        stats_after = _state_stats(result.x)
-        accept = True
-        if require_improvement:
-            improved_joint = stats_after["joint_rms"] <= (stats_before["joint_rms"] + 1e-8)
-            improved_epi = stats_after["epi_rms"] <= (stats_before["epi_rms"] + 1e-8)
-            improved_depth = True
-            if use_depth:
-                improved_depth = (
-                    stats_after["depth_rms"] <= (stats_before["depth_rms"] + 1e-8)
-                    or stats_after["depth_inliers"] >= stats_before["depth_inliers"]
+        def _build_core_support_masks(R_curr, t_curr_unit, weights):
+            epi_curr = self._epipolar_residuals(R_curr, t_curr_unit, pts1, pts2)
+            robust_scale = self._robust_residual_scale(epi_curr, epipolar_scale)
+            core_thresh = core_res_mult * robust_scale
+            support_thresh = support_res_mult * robust_scale
+            prelim_support = (np.abs(epi_curr) <= support_thresh) & (weights >= support_weight_min)
+            if np.count_nonzero(prelim_support) < support_min_matches:
+                stats = {
+                    "core_count": 0,
+                    "support_count": 0,
+                    "support_tri_mean": 0.0,
+                    "support_tri_median": 0.0,
+                    "support_ratio": 0.0,
+                    "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
+                    "robust_scale": robust_scale,
+                }
+                return (
+                    np.zeros(len(matches), dtype=bool),
+                    np.zeros(len(matches), dtype=bool),
+                    epi_curr,
+                    robust_scale,
+                    stats,
                 )
-            accept = improved_joint and improved_epi and improved_depth
-        if not accept:
-            return T_c2w, 1.0, False, {}
 
-        R_opt = stats_after["R"]
-        t_opt_unit = stats_after["t_unit"]
-        depth_scale = stats_after["depth_scale"]
+            prelim_matches = matches[prelim_support]
+            candidate_points = self._candidate_points3D_for_init(
+                T_c1w,
+                _relative_to_absolute(R_curr, t_curr_unit),
+                prelim_matches,
+                self.mpsfm_rec.images[ref_imid],
+                self.mpsfm_rec.images[qry_imid],
+                camera1,
+                camera2,
+            )
+            pair_geom = {}
+            tri_angles = candidate_points.get("tri_angle", [])
+            posdepth1 = candidate_points.get("posdepth1", [])
+            posdepth2 = candidate_points.get("posdepth2", [])
+            pair_ids = zip(candidate_points.get("pt2d_id_1", []), candidate_points.get("pt2d_id_2", []))
+            for pair, tri_angle, pd1, pd2 in zip(pair_ids, tri_angles, posdepth1, posdepth2):
+                pair_key = (int(pair[0]), int(pair[1]))
+                if pd1 and pd2:
+                    prev = pair_geom.get(pair_key, None)
+                    if (prev is None) or (tri_angle > prev):
+                        pair_geom[pair_key] = float(tri_angle)
 
-        rot_delta = R_opt @ R_rel.T
-        rot_diff = Rotation.from_matrix(rot_delta)
+            core_mask = np.zeros(len(matches), dtype=bool)
+            support_mask = np.zeros(len(matches), dtype=bool)
+            support_tri = []
+            if not pair_geom:
+                stats = {
+                    "core_count": 0,
+                    "support_count": 0,
+                    "support_tri_mean": 0.0,
+                    "support_tri_median": 0.0,
+                    "support_ratio": 0.0,
+                    "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
+                    "robust_scale": robust_scale,
+                }
+                return core_mask, support_mask, epi_curr, robust_scale, stats
+            for idx, pair in enumerate(matches):
+                pair_key = (int(pair[0]), int(pair[1]))
+                tri_angle = pair_geom.get(pair_key)
+                if tri_angle is None:
+                    continue
+                if prelim_support[idx] and tri_angle >= support_min_tri_angle:
+                    support_mask[idx] = True
+                    support_tri.append(tri_angle)
+                    if (
+                        abs(epi_curr[idx]) <= core_thresh
+                        and weights[idx] >= core_weight_min
+                        and tri_angle >= core_min_tri_angle
+                    ):
+                        core_mask[idx] = True
+
+            support_count = int(np.count_nonzero(support_mask))
+            core_count = int(np.count_nonzero(core_mask))
+            support_tri = np.asarray(support_tri, dtype=np.float64)
+            stats = {
+                "core_count": core_count,
+                "support_count": support_count,
+                "support_tri_mean": float(np.mean(support_tri)) if len(support_tri) else 0.0,
+                "support_tri_median": float(np.median(support_tri)) if len(support_tri) else 0.0,
+                "support_ratio": float(support_count / max(int(np.count_nonzero(prelim_support)), 1)),
+                "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
+                "robust_scale": robust_scale,
+            }
+            return core_mask, support_mask, epi_curr, robust_scale, stats
+
+        def _score_direction(mask_stats, state_vec, bound_t):
+            score = (
+                4.0 * mask_stats["support_count"]
+                + 2.0 * mask_stats["core_count"]
+                + 6.0 * mask_stats["support_ratio"]
+                + 0.25 * mask_stats["support_tri_median"]
+                + 0.1 * mask_stats["support_tri_mean"]
+                - 0.5 * (mask_stats["epi_rms"] / max(mask_stats["robust_scale"], 1e-6))
+            )
+            if trans_reg_weight > 0 and bound_t > 1e-9:
+                normalized_state = float(np.linalg.norm(state_vec) / bound_t)
+                score -= np.sqrt(trans_reg_weight) * float(len(matches)) * normalized_state
+            return score
+
+        def _run_stage_b(R_stage):
+            bound_t = np.tan(stage_b_max_trans)
+            best_state = np.zeros(2, dtype=np.float64)
+            current_weights = prior_weights.copy()
+            best_pack = None
+
+            for _ in range(irls_iters):
+                search_state = best_state.copy()
+                search_radii = [bound_t, 0.5 * bound_t, 0.25 * bound_t]
+                for radius in search_radii:
+                    candidates = []
+                    for dx in (-radius, 0.0, radius):
+                        for dy in (-radius, 0.0, radius):
+                            cand = np.clip(search_state + np.array([dx, dy], dtype=np.float64), -bound_t, bound_t)
+                            candidates.append(cand)
+                    # remove duplicates while keeping order
+                    unique_candidates = []
+                    seen = set()
+                    for cand in candidates:
+                        key = tuple(np.round(cand, decimals=8))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        unique_candidates.append(cand)
+
+                    local_best = None
+                    local_best_score = -np.inf
+                    for cand in unique_candidates:
+                        R_curr, t_curr_unit = _compose_relative(R_stage, t_rel_unit, np.zeros(3), cand)
+                        core_mask, support_mask, epi_curr, robust_scale, mask_stats = _build_core_support_masks(
+                            R_curr, t_curr_unit, current_weights
+                        )
+                        score = _score_direction(mask_stats, cand, bound_t)
+                        if score > local_best_score:
+                            local_best_score = score
+                            local_best = {
+                                "state": cand,
+                                "R": R_curr,
+                                "t_unit": t_curr_unit,
+                                "core_mask": core_mask,
+                                "support_mask": support_mask,
+                                "epi": epi_curr,
+                                "scale": robust_scale,
+                                "stats": mask_stats,
+                                "score": float(score),
+                            }
+                    if local_best is not None:
+                        search_state = local_best["state"]
+                        best_pack = local_best
+
+                if best_pack is None:
+                    break
+                best_state = best_pack["state"]
+                current_weights = prior_weights * self._cauchy_soft_weights(
+                    best_pack["epi"], best_pack["scale"], floor=soft_floor
+                )
+
+            return best_pack, current_weights
+
+        def _small_reprojection_refine(R_base, t_base_unit, core_mask, weights):
+            core_matches = matches[core_mask]
+            if len(core_matches) < reproj_min_points:
+                return R_base, t_base_unit, core_mask, {
+                    "num_seed_points": 0,
+                    "reproj_before_rms": 0.0,
+                    "reproj_after_rms": 0.0,
+                    "reproj_inliers_before": 0,
+                    "reproj_inliers_after": 0,
+                }
+            candidate_points = self._candidate_points3D_for_init(
+                T_c1w,
+                _relative_to_absolute(R_base, t_base_unit),
+                core_matches,
+                self.mpsfm_rec.images[ref_imid],
+                self.mpsfm_rec.images[qry_imid],
+                camera1,
+                camera2,
+            )
+            if len(candidate_points.get("xyz", [])) < reproj_min_points:
+                return R_base, t_base_unit, {
+                    "num_seed_points": int(len(candidate_points.get("xyz", []))),
+                    "reproj_before_rms": 0.0,
+                    "reproj_after_rms": 0.0,
+                    "reproj_inliers_before": 0,
+                    "reproj_inliers_after": 0,
+                }
+
+            points3D = np.asarray(candidate_points["xyz"], dtype=np.float64)
+            pts2d = kps2[np.asarray(candidate_points["pt2d_id_2"], dtype=int)]
+            pair_weights = []
+            pair_to_weight = {
+                (int(m[0]), int(m[1])): float(w)
+                for m, w in zip(matches[core_mask], np.asarray(weights[core_mask], dtype=np.float64))
+            }
+            for pair in zip(candidate_points["pt2d_id_1"], candidate_points["pt2d_id_2"]):
+                pair_weights.append(pair_to_weight.get((int(pair[0]), int(pair[1])), 1.0))
+            pair_weights = np.sqrt(np.asarray(pair_weights, dtype=np.float64))
+            bound_t = np.tan(reproj_max_trans)
+            lower = np.array(
+                [-reproj_max_rot, -reproj_max_rot, -reproj_max_rot, -bound_t, -bound_t],
+                dtype=np.float64,
+            )
+            upper = -lower
+
+            def reproj_errors(R_curr, t_curr_unit):
+                T_curr = _relative_to_absolute(R_curr, t_curr_unit)
+                xyz_cam = T_curr * points3D
+                residual = np.full((len(points3D), 2), reproj_thresh * 5.0, dtype=np.float64)
+                valid = xyz_cam[:, 2] > 1e-9
+                if np.any(valid):
+                    proj = camera2.img_from_cam(xyz_cam[valid])
+                    residual[valid] = proj - pts2d[valid]
+                return residual, valid
+
+            e_before, valid_before = reproj_errors(R_base, t_base_unit)
+            norm_before = np.linalg.norm(e_before, axis=1)
+
+            def residual(state_vec):
+                rot_state = state_vec[:3]
+                dir_state = state_vec[3:]
+                R_curr, t_curr_unit = _compose_relative(R_base, t_base_unit, rot_state, dir_state)
+                e2d, _ = reproj_errors(R_curr, t_curr_unit)
+                blocks = [pair_weights.repeat(2) * (e2d.reshape(-1) / reproj_thresh)]
+                if reproj_rot_reg > 0:
+                    blocks.append(np.sqrt(reproj_rot_reg) * rot_state)
+                if reproj_trans_reg > 0:
+                    blocks.append(np.sqrt(reproj_trans_reg) * dir_state)
+                return np.concatenate(blocks)
+
+            result = least_squares(
+                residual,
+                np.zeros(5, dtype=np.float64),
+                method="trf",
+                loss="soft_l1",
+                f_scale=1.0,
+                bounds=(lower, upper),
+                max_nfev=reproj_iters,
+            )
+            if not result.success:
+                return R_base, t_base_unit, {
+                    "num_seed_points": int(len(points3D)),
+                    "reproj_before_rms": float(np.sqrt(np.mean(norm_before**2))) if len(norm_before) else 0.0,
+                    "reproj_after_rms": float(np.sqrt(np.mean(norm_before**2))) if len(norm_before) else 0.0,
+                    "reproj_inliers_before": int(np.count_nonzero(valid_before & (norm_before <= reproj_thresh))),
+                    "reproj_inliers_after": int(np.count_nonzero(valid_before & (norm_before <= reproj_thresh))),
+                }
+
+            R_final, t_final_unit = _compose_relative(R_base, t_base_unit, result.x[:3], result.x[3:])
+            e_after, valid_after = reproj_errors(R_final, t_final_unit)
+            norm_after = np.linalg.norm(e_after, axis=1)
+            stats = {
+                "num_seed_points": int(len(points3D)),
+                "reproj_before_rms": float(np.sqrt(np.mean(norm_before**2))) if len(norm_before) else 0.0,
+                "reproj_after_rms": float(np.sqrt(np.mean(norm_after**2))) if len(norm_after) else 0.0,
+                "reproj_inliers_before": int(np.count_nonzero(valid_before & (norm_before <= reproj_thresh))),
+                "reproj_inliers_after": int(np.count_nonzero(valid_after & (norm_after <= reproj_thresh))),
+            }
+            return R_final, t_final_unit, core_mask, stats
+
+        prior_epi = self._epipolar_residuals(R_rel, t_rel_unit, pts1, pts2)
+        prior_scale = self._robust_residual_scale(prior_epi, epipolar_scale)
+        prior_weights = self._cauchy_soft_weights(prior_epi, prior_scale, floor=soft_floor)
+        if use_spatial_reweight:
+            ref_match_pts = kps1[matches[:, 0]]
+            qry_match_pts = kps2[matches[:, 1]]
+            w_ref = self._grid_cell_weights(ref_match_pts, kps1, spatial_rows, spatial_cols, spatial_power)
+            w_qry = self._grid_cell_weights(qry_match_pts, kps2, spatial_rows, spatial_cols, spatial_power)
+            spatial_weights = np.sqrt(w_ref * w_qry)
+            if spatial_weights.size > 0:
+                spatial_weights /= max(float(np.mean(spatial_weights)), 1e-6)
+                spatial_weights = np.clip(spatial_weights, spatial_min, spatial_max)
+                prior_weights = prior_weights * spatial_weights
+        prior_weights = np.clip(prior_weights, soft_floor, None)
+
+        try:
+            stage_a_result = _run_stage_a(prior_weights)
+            if not stage_a_result.success:
+                return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+            R_stage_a, _ = _compose_relative(R_rel, t_rel_unit, stage_a_result.x)
+            stage_b_pack, final_weights = _run_stage_b(R_stage_a)
+            if stage_b_pack is None:
+                return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+        except Exception as exc:
+            self.log(f"[InitPair] Bootstrap refine failed: {exc}", level=1)
+            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+
+        R_stage_b = stage_b_pack["R"]
+        t_stage_b_unit = stage_b_pack["t_unit"]
+        core_mask = stage_b_pack["core_mask"]
+        support_mask = stage_b_pack["support_mask"]
+        if int(np.count_nonzero(support_mask)) < support_min_matches or int(np.count_nonzero(core_mask)) < core_min_matches:
+            return T_c2w, core_mask, support_mask, False, {}
+
+        R_final, t_final_unit, _, reproj_stats = _small_reprojection_refine(R_stage_b, t_stage_b_unit, core_mask, final_weights)
+        core_mask, support_mask, epi_final, residual_scale_final, final_mask_stats = _build_core_support_masks(
+            R_final, t_final_unit, final_weights
+        )
+        if int(np.count_nonzero(support_mask)) < support_min_matches or int(np.count_nonzero(core_mask)) < core_min_matches:
+            return T_c2w, core_mask, support_mask, False, {}
+
+        epi_before_abs = np.abs(prior_epi)
+        epi_after_abs = np.abs(epi_final)
+        rot_delta_a = R_stage_a @ R_rel.T
+        rot_delta_b = R_stage_b @ R_rel.T
+        rot_delta_final = R_final @ R_rel.T
         trans_angle = float(
             np.rad2deg(
                 np.arccos(
                     np.clip(
-                        np.dot(t_rel_unit, t_opt_unit)
-                        / (np.linalg.norm(t_rel_unit) * np.linalg.norm(t_opt_unit)),
+                        np.dot(t_rel_unit, t_final_unit)
+                        / (np.linalg.norm(t_rel_unit) * np.linalg.norm(t_final_unit)),
                         -1.0,
                         1.0,
                     )
                 )
             )
         )
+        refined_pose = _relative_to_absolute(R_final, t_final_unit)
+        prior_scale_value, prior_scale_points = _estimate_scale_for_pose(T_c2w, support_mask)
+        refined_scale_value, refined_scale_points = _estimate_scale_for_pose(refined_pose, support_mask)
+        if (
+            np.isfinite(prior_scale_value)
+            and np.isfinite(refined_scale_value)
+            and prior_scale_value > 1e-9
+            and refined_scale_value > 1e-9
+        ):
+            scale_change_ratio = max(
+                float(refined_scale_value / prior_scale_value),
+                float(prior_scale_value / refined_scale_value),
+            )
+        else:
+            scale_change_ratio = np.inf
+        rot_gate_ok = float(np.rad2deg(Rotation.from_matrix(rot_delta_final).magnitude())) <= joint_max_rot_change_deg
+        trans_gate_ok = trans_angle <= joint_max_trans_change_deg
+        scale_gate_ok = scale_change_ratio <= joint_max_scale_change_ratio
+        accept = True
+        if require_improvement:
+            accept = (
+                float(np.sqrt(np.mean(epi_final**2))) <= float(np.sqrt(np.mean(prior_epi**2))) + 1e-8
+                and int(np.count_nonzero(support_mask)) >= support_min_matches
+                and int(np.count_nonzero(core_mask)) >= core_min_matches
+            )
+        accept = accept and rot_gate_ok and trans_gate_ok and scale_gate_ok
+        if not accept:
+            return T_c2w, core_mask, support_mask, False, {}
 
         refine_stats = {
-            "num_matches": stats_before["epi_count"],
+            "num_matches": int(len(matches)),
             "baseline_norm": baseline_norm,
-            "used_depth": bool(use_depth),
-            "num_depth_matches": stats_after["num_depth_matches"],
-            "depth_scale": depth_scale,
-            "residual_before_rms": stats_before["epi_rms"],
-            "residual_before_p95": stats_before["epi_p95"],
-            "residual_after_rms": stats_after["epi_rms"],
-            "residual_after_p95": stats_after["epi_p95"],
-            "joint_before_rms": stats_before["joint_rms"],
-            "joint_after_rms": stats_after["joint_rms"],
-            "depth_before_rms": stats_before["depth_rms"],
-            "depth_after_rms": stats_after["depth_rms"],
-            "depth_inliers_before": stats_before["depth_inliers"],
-            "depth_inliers_after": stats_after["depth_inliers"],
-            "rot_diff_deg": float(np.rad2deg(rot_diff.magnitude())),
-            "trans_angle_deg": trans_angle,
-            "loss": refine_loss,
-            "epipolar_scale": epipolar_scale,
-            "reproj_thresh": reproj_thresh,
-            "nfev": int(result.nfev),
+            "soft_filter_scale": prior_scale,
+            "soft_filter_mean_weight": float(np.mean(prior_weights)),
+            "irls_iters": irls_iters,
+            "stage_a_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_a).magnitude())),
+            "stage_b_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_b).magnitude())),
+            "final_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_final).magnitude())),
+            "final_trans_angle_deg": trans_angle,
+            "residual_before_rms": float(np.sqrt(np.mean(prior_epi**2))),
+            "residual_before_p95": float(np.percentile(epi_before_abs, 95)) if len(epi_before_abs) else 0.0,
+            "residual_after_rms": float(np.sqrt(np.mean(epi_final**2))),
+            "residual_after_p95": float(np.percentile(epi_after_abs, 95)) if len(epi_after_abs) else 0.0,
+            "core_inliers": int(np.count_nonzero(core_mask)),
+            "support_inliers": int(np.count_nonzero(support_mask)),
+            "support_score": float(stage_b_pack["score"]),
+            "support_tri_mean": float(final_mask_stats["support_tri_mean"]),
+            "support_tri_median": float(final_mask_stats["support_tri_median"]),
+            "support_ratio": float(final_mask_stats["support_ratio"]),
+            "prior_scale_value": float(prior_scale_value),
+            "refined_scale_value": float(refined_scale_value),
+            "scale_change_ratio": float(scale_change_ratio),
+            "scale_points_prior": int(prior_scale_points),
+            "scale_points_refined": int(refined_scale_points),
+            "rot_gate_ok": bool(rot_gate_ok),
+            "trans_gate_ok": bool(trans_gate_ok),
+            "scale_gate_ok": bool(scale_gate_ok),
+            "support_residual_scale": float(residual_scale_final),
+            "reproj_num_seed_points": int(reproj_stats.get("num_seed_points", 0)),
+            "reproj_before_rms": float(reproj_stats.get("reproj_before_rms", 0.0)),
+            "reproj_after_rms": float(reproj_stats.get("reproj_after_rms", 0.0)),
+            "reproj_inliers_before": int(reproj_stats.get("reproj_inliers_before", 0)),
+            "reproj_inliers_after": int(reproj_stats.get("reproj_inliers_after", 0)),
+            "spatial_reweight_enabled": bool(use_spatial_reweight),
+            "used_depth": False,
         }
-
-        refined_translation = t_opt_unit * baseline_norm
-        refined_relative = pycolmap.Rigid3d(pycolmap.Rotation3d(R_opt), refined_translation)
-        refined_pose = refined_relative * T_c1w
-        return refined_pose, depth_scale, True, refine_stats
+        return refined_pose, core_mask, support_mask, True, refine_stats
 
     @staticmethod
     def _candidate_points3D_for_init(
@@ -509,6 +883,46 @@ class MpsfmRegistration(BaseClass):
             )
         return inlier_masks
 
+    def _sanitize_ref_imids(self, ref_imids):
+        """Keep only currently registered reference images."""
+        if ref_imids is None:
+            ref_imids = self.mpsfm_rec.registered_images.keys()
+
+        reg_ids = set(self.mpsfm_rec.registered_images.keys())
+        valid_ref_ids = []
+        seen = set()
+        for ref_id in ref_imids:
+            ref_id = int(ref_id)
+            if ref_id in seen or ref_id not in reg_ids:
+                continue
+            seen.add(ref_id)
+            valid_ref_ids.append(ref_id)
+        return valid_ref_ids
+
+    def _count_ref_correspondences(self, imid, ref_imids):
+        total_corrs = 0
+        nonempty_refs = 0
+        for ref_id in ref_imids:
+            num_corrs = int(self.correspondences.num_correspondences_between_images(ref_id, imid))
+            total_corrs += num_corrs
+            if num_corrs > 0:
+                nonempty_refs += 1
+        return total_corrs, nonempty_refs
+
+    def _filter_existing_point3d_refs(self, image_ref, pts2d_ids_ref, use_3d):
+        """Drop stale Point3D references left behind after filtering."""
+        use_3d = np.asarray(use_3d, dtype=bool).copy()
+        point3D_ids = []
+        for idx, (pt2d_id, has_3d) in enumerate(zip(pts2d_ids_ref, use_3d)):
+            if not has_3d:
+                continue
+            point3D_id = int(image_ref.points2D[pt2d_id].point3D_id)
+            if point3D_id not in self.mpsfm_rec.points3D:
+                use_3d[idx] = False
+                continue
+            point3D_ids.append(point3D_id)
+        return use_3d, np.array(point3D_ids, dtype=int)
+
     def _find_2D3D_pairs_with_inlier_mask(self, im_ref_id, imid, image_ref, image, inlier_mask, pair2D3D):
         """Collect ref-to-query 2D-3D pairs under a fixed inlier mask."""
         corr = self.correspondences.matches(im_ref_id, imid)
@@ -536,9 +950,7 @@ class MpsfmRegistration(BaseClass):
 
         pts2d_ids_ref, pts2d_ids_qry = corr.T
         use_3d = np.array([image_ref.points2D[pt].has_point3D() for pt in pts2d_ids_ref], dtype=bool)
-        point3D_ids = np.array(
-            [image_ref.points2D[pt].point3D_id for pt, has_3d in zip(pts2d_ids_ref, use_3d) if has_3d], dtype=int
-        )
+        use_3d, point3D_ids = self._filter_existing_point3d_refs(image_ref, pts2d_ids_ref, use_3d)
         self._collect_pairs(
             im_ref_id,
             image_ref,
@@ -815,10 +1227,8 @@ class MpsfmRegistration(BaseClass):
 
         pts2d_ids_ref, pts2d_ids_qry = corr.T
 
-        use_3d = np.array([image_ref.points2D[pt].has_point3D() for pt in pts2d_ids_ref])
-        point3D_ids = np.array(
-            [image_ref.points2D[pt].point3D_id for pt, has_3d in zip(pts2d_ids_ref, use_3d) if has_3d]
-        )
+        use_3d = np.array([image_ref.points2D[pt].has_point3D() for pt in pts2d_ids_ref], dtype=bool)
+        use_3d, point3D_ids = self._filter_existing_point3d_refs(image_ref, pts2d_ids_ref, use_3d)
         self._collect_pairs(
             im_ref_id,
             image_ref,
@@ -882,15 +1292,23 @@ class MpsfmRegistration(BaseClass):
             matches_used = matches[prior_inlier_mask] if use_prior_only else matches
 
             if self.conf.refine_init_prior_pose:
-                refine_matches = matches_used if len(matches_used) > 0 else matches
-                T_c2w_refined, refined_rescale, refined_ok, refine_stats = self._refine_init_pair_pose_joint(
+                refine_matches = matches
+                T_c2w_refined, core_inlier_mask, support_inlier_mask, refined_ok, refine_stats = self._refine_init_pair_pose_bootstrap(
                     imid1, imid2, T_c1w, T_c2w, refine_matches, kps1, kps2, camera1, camera2
                 )
                 if refined_ok:
                     T_c2w = T_c2w_refined
-                    if refine_stats.get("used_depth", False):
-                        rescale = refined_rescale
-                    else:
+                    joint_inlier_mask = prior_inlier_mask & support_inlier_mask
+                    selected_mask = None
+                    if int(np.count_nonzero(joint_inlier_mask)) >= 3:
+                        selected_mask = joint_inlier_mask
+                    elif prior_inliers >= 3:
+                        selected_mask = prior_inlier_mask
+                    self.mpsfm_rec.last_ap_inlier_masks = {
+                        imid1: selected_mask if selected_mask is not None else prior_inlier_mask
+                    }
+                    if selected_mask is not None:
+                        matches_used = matches[selected_mask]
                         pts_tri_refined = self._candidate_points3D_for_init(
                             T_c1w,
                             T_c2w,
@@ -901,24 +1319,8 @@ class MpsfmRegistration(BaseClass):
                             camera2,
                         )
                         rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_refined)
-                    refined_mask = self._inlier_mask_for_pair_under_pose(
-                        imid1,
-                        imid2,
-                        T_c1w,
-                        T_c2w,
-                        camera1,
-                        camera2,
-                        matches,
-                        kps1,
-                        kps2,
-                        log_stage="post_refine",
-                    )
-                    self.mpsfm_rec.last_ap_inlier_masks = {imid1: refined_mask}
-                    refined_inliers = int(refined_mask.sum())
-                    if refined_inliers >= fallback_thresh:
-                        matches_used = matches[refined_mask]
-                    else:
-                        matches_used = matches
+                else:
+                    self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
         else:
             unproj_cam0, valid_lifted0 = self._lift_points_for_init(imid1, kps1, camera1)
             valid_matches0 = matches[valid_lifted0[matches[:, 0]]]
@@ -1011,9 +1413,14 @@ class MpsfmRegistration(BaseClass):
             self._update_world_sim_from_priors()
             image.cam_from_world = self.mpsfm_rec.align_prior_pose_to_current_world(prior_pose)
 
-            if ref_imids is None:
-                ref_imids = self.mpsfm_rec.registered_images.keys()
-            ref_imids = list(ref_imids)
+            ref_imids = self._sanitize_ref_imids(ref_imids)
+            if len(ref_imids) == 0:
+                print(f"\nImage {imid} has no valid registered reference images")
+                return False
+            total_corrs, nonempty_refs = self._count_ref_correspondences(imid, ref_imids)
+            if total_corrs == 0:
+                print(f"\nImage {imid} has no correspondences to registered reference images")
+                return False
 
             kps_qry = self.mpsfm_rec.keypoints(imid)
             camera_qry = camera
@@ -1041,14 +1448,22 @@ class MpsfmRegistration(BaseClass):
                 )
 
             self.mpsfm_rec.last_ap_inlier_masks = inlier_masks_map
+            if nonempty_refs == 0:
+                print(f"\nImage {imid} has no usable registered reference images")
+                return False
             self.mpsfm_rec.register_image(imid)
             return True
 
-        if ref_imids is None:
-            ref_imids = self.mpsfm_rec.registered_images.keys()
+        ref_imids = self._sanitize_ref_imids(ref_imids)
+        if len(ref_imids) == 0:
+            print(f"\nImage {imid} has no valid registered reference images")
+            return False
+        total_corrs, _ = self._count_ref_correspondences(imid, ref_imids)
+        if total_corrs == 0:
+            print(f"\nImage {imid} has no correspondences to registered reference images")
+            return False
 
         self.registration_cache[imid]["store_matches"] = {}
-        ref_imids = list(ref_imids)
         ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
         if self.half_ap_min_inliers:
             ap_min_num_inliers = int(ap_min_num_inliers / (1.2**self.half_ap_min_inliers))
@@ -1150,6 +1565,9 @@ class MpsfmRegistration(BaseClass):
     def register_and_triangulate_next_image(self, imid, ref_imids=None):
         """Register next image and triangulate points."""
         if not self.register_next_image(imid, ref_imids=ref_imids):
+            return False
+        if int(self.correspondences.num_correspondences_for_image(imid)) == 0:
+            print(f"\nImage {imid} has no graph correspondences after registration")
             return False
 
         return self.triangulate_image(imid)

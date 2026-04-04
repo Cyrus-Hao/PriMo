@@ -155,6 +155,13 @@ class ImageSelection(BaseClass):
                 for im_id, image in self.mpsfm_rec.images.items()
                 if not image.has_pose and im_id not in self.freeze_imids
             ]
+        reg_imids = list(self.mpsfm_rec.registered_images.keys())
+        if reg_imids:
+            qry_imids = [
+                im_id
+                for im_id in qry_imids
+                if any(self.correspondences.num_correspondences_between_images(im_id, reg_imid) > 0 for reg_imid in reg_imids)
+            ]
         if len(qry_imids) == 0:
             return False
 

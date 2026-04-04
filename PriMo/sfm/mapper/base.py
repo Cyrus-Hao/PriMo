@@ -409,9 +409,11 @@ class MpsfmMapper(BaseClass):
                 if self.depth_consistency_checker.pre_fail(self.nextview.candid):
                     continue
 
-            if self.mpsfm_rec.best_next_ref_imid is not None:
-                ref_imids = self.find_local_bundle(self.mpsfm_rec.best_next_ref_imid, return_points=False)["optim_ids"]
+            best_ref_imid = self.mpsfm_rec.best_next_ref_imid
+            if best_ref_imid is not None and best_ref_imid in self.mpsfm_rec.registered_images:
+                ref_imids = self.find_local_bundle(best_ref_imid, return_points=False)["optim_ids"]
             else:
+                self.mpsfm_rec.best_next_ref_imid = None
                 ref_imids = None
             if not self.registration.register_and_triangulate_next_image(self.nextview.candid, ref_imids=ref_imids):
                 self.at_registration_failure()
@@ -809,6 +811,8 @@ class MpsfmMapper(BaseClass):
                 obs.deregister_image(imid)
         # manually returning filtered image ids
         filtered_images = registered_images_before - set(self.mpsfm_rec.registered_images.keys())
+        if self.mpsfm_rec.best_next_ref_imid in filtered_images:
+            self.mpsfm_rec.best_next_ref_imid = None
         return filtered_images
 
     def find_local_bundle(self, refimid, num_images=None, return_points=True):
@@ -819,6 +823,12 @@ class MpsfmMapper(BaseClass):
                 "optim_ids": set([refimid]),
             }
         rec = self.mpsfm_rec
+        if refimid not in rec.registered_images:
+            out = {"ref_id": refimid, "optim_ids": set(rec.registered_images.keys())}
+            if return_points:
+                out["pts3D"] = set()
+                out["constpoints"] = set()
+            return out
         optim_imids = set(rec.find_local_bundle_ids(refimid, num_images)) | {refimid}
         out = {"ref_id": refimid, "optim_ids": optim_imids}
 
