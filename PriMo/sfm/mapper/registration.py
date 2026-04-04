@@ -78,6 +78,14 @@ class MpsfmRegistration(BaseClass):
         "init_joint_refine_max_trans_change_deg": 6.0,
         "init_joint_refine_max_scale_change_ratio": 1.5,
         "init_joint_refine_require_improvement": True,
+        "init_stageb_min_support_count": 32,
+        "init_stageb_min_support_ratio": 0.6,
+        "init_stageb_min_support_tri_median_deg": 0.8,
+        "init_stageb_min_support_tri_p25_deg": 0.3,
+        "init_lookahead_topk": 5,
+        "init_lookahead_min_inlier_gain": 6,
+        "init_lookahead_min_reproj_gain_px": 0.25,
+        "init_lookahead_min_score_gain": 2.0,
         "refine_remaining_prior_pose": True,
         "prior_pose_refine_min_corrs": 24,
         "prior_pose_refine_max_iters": 150,
@@ -273,22 +281,28 @@ class MpsfmRegistration(BaseClass):
     def _refine_init_pair_pose_bootstrap(
         self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
     ):
+        empty_out = {
+            "rotation": None,
+            "full": None,
+            "stage_b_enabled": False,
+        }
         if not self.conf.refine_init_prior_pose:
-            return T_c2w, np.zeros(0, dtype=bool), np.zeros(0, dtype=bool), False, {}
+            return empty_out
         matches = np.asarray(matches)
+        zero_mask = np.zeros(len(matches), dtype=bool)
         min_matches = self.conf.epipolar_refine_min_matches
         if len(matches) < min_matches:
-            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+            return empty_out
 
         pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
         pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
         if len(pts1) < min_matches:
-            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+            return empty_out
 
         R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
         baseline_norm = float(np.linalg.norm(t_rel))
         if baseline_norm < 1e-9:
-            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+            return empty_out
         t_rel_unit = self._normalize_translation(t_rel)
 
         epipolar_scale = max(float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2)), 1e-6)
@@ -321,6 +335,19 @@ class MpsfmRegistration(BaseClass):
             float(getattr(self.conf, "init_joint_refine_max_scale_change_ratio", 1.5)), 1.0
         )
         require_improvement = bool(getattr(self.conf, "init_joint_refine_require_improvement", True))
+        stageb_min_support_count = max(
+            int(getattr(self.conf, "init_stageb_min_support_count", 32)),
+            support_min_matches,
+        )
+        stageb_min_support_ratio = max(float(getattr(self.conf, "init_stageb_min_support_ratio", 0.6)), 0.0)
+        stageb_min_support_tri_median = max(
+            float(getattr(self.conf, "init_stageb_min_support_tri_median_deg", 0.8)),
+            support_min_tri_angle,
+        )
+        stageb_min_support_tri_p25 = max(
+            float(getattr(self.conf, "init_stageb_min_support_tri_p25_deg", 0.3)),
+            0.0,
+        )
         use_spatial_reweight = bool(getattr(self.conf, "init_spatial_reweight", True))
         spatial_rows = max(int(getattr(self.conf, "init_spatial_grid_rows", 4)), 1)
         spatial_cols = max(int(getattr(self.conf, "init_spatial_grid_cols", 4)), 1)
@@ -398,6 +425,7 @@ class MpsfmRegistration(BaseClass):
                     "support_count": 0,
                     "support_tri_mean": 0.0,
                     "support_tri_median": 0.0,
+                    "support_tri_p25": 0.0,
                     "support_ratio": 0.0,
                     "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
                     "robust_scale": robust_scale,
@@ -441,6 +469,7 @@ class MpsfmRegistration(BaseClass):
                     "support_count": 0,
                     "support_tri_mean": 0.0,
                     "support_tri_median": 0.0,
+                    "support_tri_p25": 0.0,
                     "support_ratio": 0.0,
                     "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
                     "robust_scale": robust_scale,
@@ -469,6 +498,7 @@ class MpsfmRegistration(BaseClass):
                 "support_count": support_count,
                 "support_tri_mean": float(np.mean(support_tri)) if len(support_tri) else 0.0,
                 "support_tri_median": float(np.median(support_tri)) if len(support_tri) else 0.0,
+                "support_tri_p25": float(np.percentile(support_tri, 25)) if len(support_tri) else 0.0,
                 "support_ratio": float(support_count / max(int(np.count_nonzero(prelim_support)), 1)),
                 "epi_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
                 "robust_scale": robust_scale,
@@ -663,49 +693,129 @@ class MpsfmRegistration(BaseClass):
                 prior_weights = prior_weights * spatial_weights
         prior_weights = np.clip(prior_weights, soft_floor, None)
 
+        def _trans_angle_deg(base_t, cand_t):
+            return float(
+                np.rad2deg(
+                    np.arccos(
+                        np.clip(
+                            np.dot(base_t, cand_t) / (np.linalg.norm(base_t) * np.linalg.norm(cand_t)),
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                )
+            )
+
+        def _make_hypothesis(stage_name, pose, R_curr, t_curr_unit, core_mask, support_mask, epi_curr, mask_stats, extra):
+            rot_delta = R_curr @ R_rel.T
+            stats = {
+                "stage": stage_name,
+                "num_matches": int(len(matches)),
+                "baseline_norm": baseline_norm,
+                "soft_filter_scale": prior_scale,
+                "soft_filter_mean_weight": float(np.mean(prior_weights)),
+                "irls_iters": irls_iters,
+                "rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta).magnitude())),
+                "trans_angle_deg": _trans_angle_deg(t_rel_unit, t_curr_unit),
+                "residual_before_rms": float(np.sqrt(np.mean(prior_epi**2))),
+                "residual_after_rms": float(np.sqrt(np.mean(epi_curr**2))) if len(epi_curr) else 0.0,
+                "core_inliers": int(np.count_nonzero(core_mask)),
+                "support_inliers": int(np.count_nonzero(support_mask)),
+                "support_tri_mean": float(mask_stats["support_tri_mean"]),
+                "support_tri_median": float(mask_stats["support_tri_median"]),
+                "support_tri_p25": float(mask_stats["support_tri_p25"]),
+                "support_ratio": float(mask_stats["support_ratio"]),
+                "support_residual_scale": float(mask_stats["robust_scale"]),
+                "spatial_reweight_enabled": bool(use_spatial_reweight),
+                "used_depth": False,
+            }
+            stats.update(extra)
+            return {
+                "pose": pose,
+                "core_mask": core_mask,
+                "support_mask": support_mask,
+                "stats": stats,
+            }
+
         try:
             stage_a_result = _run_stage_a(prior_weights)
             if not stage_a_result.success:
-                return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
-            R_stage_a, _ = _compose_relative(R_rel, t_rel_unit, stage_a_result.x)
-            stage_b_pack, final_weights = _run_stage_b(R_stage_a)
-            if stage_b_pack is None:
-                return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+                return empty_out
+            R_stage_a, t_stage_a_unit = _compose_relative(R_rel, t_rel_unit, stage_a_result.x)
+            stage_a_pose = _relative_to_absolute(R_stage_a, t_stage_a_unit)
+            stage_a_core_mask, stage_a_support_mask, epi_stage_a, stage_a_scale, stage_a_mask_stats = (
+                _build_core_support_masks(R_stage_a, t_stage_a_unit, prior_weights)
+            )
         except Exception as exc:
             self.log(f"[InitPair] Bootstrap refine failed: {exc}", level=1)
-            return T_c2w, np.zeros(len(matches), dtype=bool), np.zeros(len(matches), dtype=bool), False, {}
+            return empty_out
+
+        rotation_hyp = _make_hypothesis(
+            "rotation_only",
+            stage_a_pose,
+            R_stage_a,
+            t_stage_a_unit,
+            stage_a_core_mask,
+            stage_a_support_mask,
+            epi_stage_a,
+            stage_a_mask_stats,
+            {},
+        )
+
+        strong_geometry = (
+            int(np.count_nonzero(stage_a_support_mask)) >= stageb_min_support_count
+            and int(np.count_nonzero(stage_a_core_mask)) >= core_min_matches
+            and float(stage_a_mask_stats["support_ratio"]) >= stageb_min_support_ratio
+            and float(stage_a_mask_stats["support_tri_median"]) >= stageb_min_support_tri_median
+            and float(stage_a_mask_stats["support_tri_p25"]) >= stageb_min_support_tri_p25
+        )
+        rotation_hyp["stats"]["stage_b_enabled"] = bool(strong_geometry)
+
+        if not strong_geometry:
+            return {
+                "rotation": rotation_hyp,
+                "full": None,
+                "stage_b_enabled": False,
+            }
+
+        try:
+            stage_b_pack, final_weights = _run_stage_b(R_stage_a)
+            if stage_b_pack is None:
+                return {
+                    "rotation": rotation_hyp,
+                    "full": None,
+                    "stage_b_enabled": True,
+                }
+        except Exception as exc:
+            self.log(f"[InitPair] Stage B refine failed: {exc}", level=1)
+            return {
+                "rotation": rotation_hyp,
+                "full": None,
+                "stage_b_enabled": True,
+            }
 
         R_stage_b = stage_b_pack["R"]
         t_stage_b_unit = stage_b_pack["t_unit"]
         core_mask = stage_b_pack["core_mask"]
         support_mask = stage_b_pack["support_mask"]
         if int(np.count_nonzero(support_mask)) < support_min_matches or int(np.count_nonzero(core_mask)) < core_min_matches:
-            return T_c2w, core_mask, support_mask, False, {}
+            return {
+                "rotation": rotation_hyp,
+                "full": None,
+                "stage_b_enabled": True,
+            }
 
         R_final, t_final_unit, _, reproj_stats = _small_reprojection_refine(R_stage_b, t_stage_b_unit, core_mask, final_weights)
         core_mask, support_mask, epi_final, residual_scale_final, final_mask_stats = _build_core_support_masks(
             R_final, t_final_unit, final_weights
         )
         if int(np.count_nonzero(support_mask)) < support_min_matches or int(np.count_nonzero(core_mask)) < core_min_matches:
-            return T_c2w, core_mask, support_mask, False, {}
+            return {
+                "rotation": rotation_hyp,
+                "full": None,
+                "stage_b_enabled": True,
+            }
 
-        epi_before_abs = np.abs(prior_epi)
-        epi_after_abs = np.abs(epi_final)
-        rot_delta_a = R_stage_a @ R_rel.T
-        rot_delta_b = R_stage_b @ R_rel.T
-        rot_delta_final = R_final @ R_rel.T
-        trans_angle = float(
-            np.rad2deg(
-                np.arccos(
-                    np.clip(
-                        np.dot(t_rel_unit, t_final_unit)
-                        / (np.linalg.norm(t_rel_unit) * np.linalg.norm(t_final_unit)),
-                        -1.0,
-                        1.0,
-                    )
-                )
-            )
-        )
         refined_pose = _relative_to_absolute(R_final, t_final_unit)
         prior_scale_value, prior_scale_points = _estimate_scale_for_pose(T_c2w, support_mask)
         refined_scale_value, refined_scale_points = _estimate_scale_for_pose(refined_pose, support_mask)
@@ -721,58 +831,53 @@ class MpsfmRegistration(BaseClass):
             )
         else:
             scale_change_ratio = np.inf
-        rot_gate_ok = float(np.rad2deg(Rotation.from_matrix(rot_delta_final).magnitude())) <= joint_max_rot_change_deg
+        rot_diff_deg = float(np.rad2deg(Rotation.from_matrix(R_final @ R_rel.T).magnitude()))
+        trans_angle = _trans_angle_deg(t_rel_unit, t_final_unit)
+        rot_gate_ok = rot_diff_deg <= joint_max_rot_change_deg
         trans_gate_ok = trans_angle <= joint_max_trans_change_deg
         scale_gate_ok = scale_change_ratio <= joint_max_scale_change_ratio
-        accept = True
+        epi_gate_ok = True
         if require_improvement:
-            accept = (
-                float(np.sqrt(np.mean(epi_final**2))) <= float(np.sqrt(np.mean(prior_epi**2))) + 1e-8
-                and int(np.count_nonzero(support_mask)) >= support_min_matches
-                and int(np.count_nonzero(core_mask)) >= core_min_matches
-            )
-        accept = accept and rot_gate_ok and trans_gate_ok and scale_gate_ok
-        if not accept:
-            return T_c2w, core_mask, support_mask, False, {}
+            epi_gate_ok = float(np.sqrt(np.mean(epi_final**2))) <= float(np.sqrt(np.mean(prior_epi**2))) + 1e-8
 
-        refine_stats = {
-            "num_matches": int(len(matches)),
-            "baseline_norm": baseline_norm,
-            "soft_filter_scale": prior_scale,
-            "soft_filter_mean_weight": float(np.mean(prior_weights)),
-            "irls_iters": irls_iters,
-            "stage_a_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_a).magnitude())),
-            "stage_b_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_b).magnitude())),
-            "final_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(rot_delta_final).magnitude())),
-            "final_trans_angle_deg": trans_angle,
-            "residual_before_rms": float(np.sqrt(np.mean(prior_epi**2))),
-            "residual_before_p95": float(np.percentile(epi_before_abs, 95)) if len(epi_before_abs) else 0.0,
-            "residual_after_rms": float(np.sqrt(np.mean(epi_final**2))),
-            "residual_after_p95": float(np.percentile(epi_after_abs, 95)) if len(epi_after_abs) else 0.0,
-            "core_inliers": int(np.count_nonzero(core_mask)),
-            "support_inliers": int(np.count_nonzero(support_mask)),
-            "support_score": float(stage_b_pack["score"]),
-            "support_tri_mean": float(final_mask_stats["support_tri_mean"]),
-            "support_tri_median": float(final_mask_stats["support_tri_median"]),
-            "support_ratio": float(final_mask_stats["support_ratio"]),
-            "prior_scale_value": float(prior_scale_value),
-            "refined_scale_value": float(refined_scale_value),
-            "scale_change_ratio": float(scale_change_ratio),
-            "scale_points_prior": int(prior_scale_points),
-            "scale_points_refined": int(refined_scale_points),
-            "rot_gate_ok": bool(rot_gate_ok),
-            "trans_gate_ok": bool(trans_gate_ok),
-            "scale_gate_ok": bool(scale_gate_ok),
-            "support_residual_scale": float(residual_scale_final),
-            "reproj_num_seed_points": int(reproj_stats.get("num_seed_points", 0)),
-            "reproj_before_rms": float(reproj_stats.get("reproj_before_rms", 0.0)),
-            "reproj_after_rms": float(reproj_stats.get("reproj_after_rms", 0.0)),
-            "reproj_inliers_before": int(reproj_stats.get("reproj_inliers_before", 0)),
-            "reproj_inliers_after": int(reproj_stats.get("reproj_inliers_after", 0)),
-            "spatial_reweight_enabled": bool(use_spatial_reweight),
-            "used_depth": False,
+        full_hyp = None
+        if rot_gate_ok and trans_gate_ok and scale_gate_ok and epi_gate_ok:
+            full_hyp = _make_hypothesis(
+                "full_refine",
+                refined_pose,
+                R_final,
+                t_final_unit,
+                core_mask,
+                support_mask,
+                epi_final,
+                final_mask_stats,
+                {
+                    "stage_a_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(R_stage_a @ R_rel.T).magnitude())),
+                    "stage_b_rot_diff_deg": float(np.rad2deg(Rotation.from_matrix(R_stage_b @ R_rel.T).magnitude())),
+                    "support_score": float(stage_b_pack["score"]),
+                    "prior_scale_value": float(prior_scale_value),
+                    "refined_scale_value": float(refined_scale_value),
+                    "scale_change_ratio": float(scale_change_ratio),
+                    "scale_points_prior": int(prior_scale_points),
+                    "scale_points_refined": int(refined_scale_points),
+                    "rot_gate_ok": bool(rot_gate_ok),
+                    "trans_gate_ok": bool(trans_gate_ok),
+                    "scale_gate_ok": bool(scale_gate_ok),
+                    "epi_gate_ok": bool(epi_gate_ok),
+                    "reproj_num_seed_points": int(reproj_stats.get("num_seed_points", 0)),
+                    "reproj_before_rms": float(reproj_stats.get("reproj_before_rms", 0.0)),
+                    "reproj_after_rms": float(reproj_stats.get("reproj_after_rms", 0.0)),
+                    "reproj_inliers_before": int(reproj_stats.get("reproj_inliers_before", 0)),
+                    "reproj_inliers_after": int(reproj_stats.get("reproj_inliers_after", 0)),
+                    "support_residual_scale": float(residual_scale_final),
+                },
+            )
+
+        return {
+            "rotation": rotation_hyp,
+            "full": full_hyp,
+            "stage_b_enabled": True,
         }
-        return refined_pose, core_mask, support_mask, True, refine_stats
 
     @staticmethod
     def _candidate_points3D_for_init(
@@ -819,6 +924,312 @@ class MpsfmRegistration(BaseClass):
         if not np.any(valid):
             return 1.0
         return float(np.median(z[valid] / d[valid]))
+
+    def _select_init_seed_mask(self, prior_mask, core_mask=None, support_mask=None, min_matches=3):
+        prior_mask = np.asarray(prior_mask, dtype=bool)
+        candidates = [("prior", prior_mask)]
+        if support_mask is not None:
+            support_mask = np.asarray(support_mask, dtype=bool)
+            candidates.insert(0, ("prior_support", prior_mask & support_mask))
+        if core_mask is not None:
+            core_mask = np.asarray(core_mask, dtype=bool)
+            candidates.insert(0, ("prior_core", prior_mask & core_mask))
+
+        seen = set()
+        for label, mask in candidates:
+            key = mask.tobytes()
+            if key in seen:
+                continue
+            seen.add(key)
+            if int(np.count_nonzero(mask)) >= min_matches:
+                return mask, label
+        return None, "invalid"
+
+    def _init_pair_prior_inlier_mask_from_pose(
+        self, ref_imid, qry_imid, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
+    ):
+        matches = np.asarray(matches)
+        if len(matches) == 0:
+            return np.zeros(0, dtype=bool)
+
+        pts1 = self._normalized_keypoints(camera1, kps1[matches[:, 0]])
+        pts2 = self._normalized_keypoints(camera2, kps2[matches[:, 1]])
+        if len(pts1) == 0:
+            return np.zeros(len(matches), dtype=bool)
+
+        R_rel, t_rel = self._relative_pose_components(T_c1w, T_c2w)
+        if float(np.linalg.norm(t_rel)) < 1e-9:
+            return np.zeros(len(matches), dtype=bool)
+        t_rel_unit = self._normalize_translation(t_rel)
+
+        epipolar_scale = max(float(getattr(self.conf, "epipolar_refine_f_scale", 1e-2)), 1e-6)
+        support_res_mult = max(float(getattr(self.conf, "init_support_inlier_residual_mult", 4.0)), 1.0)
+        support_min_tri_angle = float(getattr(self.conf, "init_support_min_tri_angle", 0.03))
+
+        epi = self._epipolar_residuals(R_rel, t_rel_unit, pts1, pts2)
+        robust_scale = self._robust_residual_scale(epi, epipolar_scale)
+        support_thresh = support_res_mult * robust_scale
+
+        candidate_points = self._candidate_points3D_for_init(
+            T_c1w,
+            T_c2w,
+            matches,
+            self.mpsfm_rec.images[ref_imid],
+            self.mpsfm_rec.images[qry_imid],
+            camera1,
+            camera2,
+        )
+        valid_pairs = set()
+        for pt1, pt2, tri_angle, posdepth1, posdepth2 in zip(
+            candidate_points.get("pt2d_id_1", []),
+            candidate_points.get("pt2d_id_2", []),
+            candidate_points.get("tri_angle", []),
+            candidate_points.get("posdepth1", []),
+            candidate_points.get("posdepth2", []),
+        ):
+            if tri_angle >= support_min_tri_angle and posdepth1 and posdepth2:
+                valid_pairs.add((int(pt1), int(pt2)))
+
+        mask = np.zeros(len(matches), dtype=bool)
+        for idx, pair in enumerate(matches):
+            pair_key = (int(pair[0]), int(pair[1]))
+            if pair_key in valid_pairs and abs(epi[idx]) <= support_thresh:
+                mask[idx] = True
+        return mask
+
+    def _build_init_seed_data(self, imid1, imid2, T_c1w, T_c2w, matches_used, camera1, camera2):
+        candidate_points = self._candidate_points3D_for_init(
+            T_c1w,
+            T_c2w,
+            matches_used,
+            self.mpsfm_rec.images[imid1],
+            self.mpsfm_rec.images[imid2],
+            camera1,
+            camera2,
+        )
+        min_tri_angle = float(self.conf.colmap_options.init_min_tri_angle)
+        seed_entries = []
+        ref_maps = {
+            imid1: defaultdict(list),
+            imid2: defaultdict(list),
+        }
+
+        for pt1, pt2, tri_angle, posdepth1, posdepth2, xyz in zip(
+            candidate_points.get("pt2d_id_1", []),
+            candidate_points.get("pt2d_id_2", []),
+            candidate_points.get("tri_angle", []),
+            candidate_points.get("posdepth1", []),
+            candidate_points.get("posdepth2", []),
+            candidate_points.get("xyz", []),
+        ):
+            if tri_angle < min_tri_angle or (not posdepth1) or (not posdepth2):
+                continue
+            seed_idx = len(seed_entries)
+            seed_entries.append(
+                {
+                    "pt2d_id_1": int(pt1),
+                    "pt2d_id_2": int(pt2),
+                    "tri_angle": float(tri_angle),
+                    "xyz": np.asarray(xyz, dtype=np.float64),
+                }
+            )
+            ref_maps[imid1][int(pt1)].append(seed_idx)
+            ref_maps[imid2][int(pt2)].append(seed_idx)
+
+        return {
+            "entries": seed_entries,
+            "ref_maps": ref_maps,
+            "num_seed_points": int(len(seed_entries)),
+        }
+
+    def _select_init_lookahead_images(self, imid1, imid2):
+        topk = max(int(getattr(self.conf, "init_lookahead_topk", 5)), 1)
+        name1 = self.mpsfm_rec.images[imid1].name
+        name2 = self.mpsfm_rec.images[imid2].name
+        ranked = []
+
+        for cand_imid, image in self.mpsfm_rec.images.items():
+            if cand_imid in {imid1, imid2}:
+                continue
+            corr_total = int(self.correspondences.num_correspondences_between_images(imid1, cand_imid)) + int(
+                self.correspondences.num_correspondences_between_images(imid2, cand_imid)
+            )
+            if corr_total == 0:
+                continue
+            pair_score = float(
+                self.correspondences.inlier_match_scores.get(
+                    frozenset([name1, image.name]),
+                    0.0,
+                )
+                + self.correspondences.inlier_match_scores.get(
+                    frozenset([name2, image.name]),
+                    0.0,
+                )
+            )
+            ranked.append((pair_score, corr_total, cand_imid))
+
+        ranked.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
+        return [cand_imid for _, _, cand_imid in ranked[:topk]]
+
+    def _evaluate_init_hypothesis_lookahead(self, imid1, imid2, seed_data, lookahead_imids):
+        if seed_data["num_seed_points"] < 3 or len(lookahead_imids) == 0:
+            return {
+                "num_evaluated": int(len(lookahead_imids)),
+                "num_registerable": 0,
+                "median_inliers": 0.0,
+                "median_inlier_ratio": 0.0,
+                "mean_reproj_rmse": float("inf"),
+                "score": -float(seed_data["num_seed_points"]),
+            }
+
+        seed_xyz = np.asarray([entry["xyz"] for entry in seed_data["entries"]], dtype=np.float64)
+        ap_min_num_inliers = int(self.conf.colmap_options.abs_pose_min_num_inliers)
+        eval_stats = []
+
+        for qry_imid in lookahead_imids:
+            votes = defaultdict(lambda: defaultdict(int))
+            for ref_imid in (imid1, imid2):
+                corr = self.correspondences.matches(ref_imid, qry_imid)
+                if len(corr) == 0:
+                    continue
+                for ref_pt, qry_pt in corr:
+                    for seed_idx in seed_data["ref_maps"][ref_imid].get(int(ref_pt), []):
+                        votes[int(qry_pt)][seed_idx] += 1
+
+            if not votes:
+                eval_stats.append({"registerable": False, "inliers": 0, "inlier_ratio": 0.0, "reproj_rmse": float("inf")})
+                continue
+
+            kps_qry = self.mpsfm_rec.keypoints(qry_imid)
+            camera_qry = self.mpsfm_rec.camera(qry_imid)
+            points2D = []
+            points3D = []
+            for qry_pt, seed_votes in votes.items():
+                best_seed_idx = max(seed_votes.items(), key=lambda item: (item[1], -item[0]))[0]
+                points2D.append(kps_qry[qry_pt])
+                points3D.append(seed_xyz[best_seed_idx])
+
+            points2D = np.asarray(points2D, dtype=np.float64)
+            points3D = np.asarray(points3D, dtype=np.float64)
+            if len(points2D) < 4:
+                eval_stats.append({"registerable": False, "inliers": 0, "inlier_ratio": 0.0, "reproj_rmse": float("inf")})
+                continue
+
+            ap_info = self.absolute_pose_estimator(points2D, points3D, camera_qry)
+            if ap_info is None:
+                eval_stats.append({"registerable": False, "inliers": 0, "inlier_ratio": 0.0, "reproj_rmse": float("inf")})
+                continue
+
+            inlier_mask = np.asarray(ap_info["inlier_mask"], dtype=bool)
+            num_inliers = int(ap_info["num_inliers"])
+            registerable = num_inliers >= ap_min_num_inliers
+            reproj_rmse = float("inf")
+            if np.any(inlier_mask):
+                xyz_cam = ap_info["cam_from_world"] * points3D[inlier_mask]
+                valid = xyz_cam[:, 2] > 1e-9
+                if np.any(valid):
+                    proj = camera_qry.img_from_cam(xyz_cam[valid])
+                    xy_target = points2D[inlier_mask][valid]
+                    reproj_rmse = float(np.sqrt(np.mean(np.sum((proj - xy_target) ** 2, axis=1))))
+
+            eval_stats.append(
+                {
+                    "registerable": bool(registerable),
+                    "inliers": num_inliers,
+                    "inlier_ratio": float(num_inliers / max(len(points2D), 1)),
+                    "reproj_rmse": reproj_rmse,
+                }
+            )
+
+        reg_stats = [stat for stat in eval_stats if stat["registerable"]]
+        if reg_stats:
+            median_inliers = float(np.median([stat["inliers"] for stat in reg_stats]))
+            median_inlier_ratio = float(np.median([stat["inlier_ratio"] for stat in reg_stats]))
+            mean_reproj_rmse = float(np.mean([stat["reproj_rmse"] for stat in reg_stats]))
+        else:
+            median_inliers = 0.0
+            median_inlier_ratio = 0.0
+            mean_reproj_rmse = float("inf")
+
+        num_registerable = int(sum(stat["registerable"] for stat in eval_stats))
+        score = (
+            100.0 * num_registerable
+            + 1.0 * median_inliers
+            + 20.0 * median_inlier_ratio
+            - 0.5 * (mean_reproj_rmse if np.isfinite(mean_reproj_rmse) else 1e3)
+            + 0.05 * float(seed_data["num_seed_points"])
+        )
+        return {
+            "num_evaluated": int(len(lookahead_imids)),
+            "num_registerable": num_registerable,
+            "median_inliers": median_inliers,
+            "median_inlier_ratio": median_inlier_ratio,
+            "mean_reproj_rmse": mean_reproj_rmse,
+            "score": float(score),
+        }
+
+    def _is_refined_init_hypothesis_better(self, refined_stats, prior_stats):
+        min_inlier_gain = float(getattr(self.conf, "init_lookahead_min_inlier_gain", 6))
+        min_reproj_gain = float(getattr(self.conf, "init_lookahead_min_reproj_gain_px", 0.25))
+        min_score_gain = float(getattr(self.conf, "init_lookahead_min_score_gain", 2.0))
+
+        if refined_stats["num_registerable"] > prior_stats["num_registerable"]:
+            return True
+        if refined_stats["num_registerable"] < prior_stats["num_registerable"]:
+            return False
+        if refined_stats["median_inliers"] >= prior_stats["median_inliers"] + min_inlier_gain:
+            return True
+        if (
+            np.isfinite(refined_stats["mean_reproj_rmse"])
+            and np.isfinite(prior_stats["mean_reproj_rmse"])
+            and refined_stats["mean_reproj_rmse"] <= prior_stats["mean_reproj_rmse"] - min_reproj_gain
+            and refined_stats["median_inliers"] >= prior_stats["median_inliers"]
+        ):
+            return True
+        return refined_stats["score"] >= prior_stats["score"] + min_score_gain
+
+    def _make_init_hypothesis(
+        self,
+        name,
+        pose,
+        prior_mask,
+        matches,
+        imid1,
+        imid2,
+        T_c1w,
+        kps1,
+        camera1,
+        camera2,
+        core_mask=None,
+        support_mask=None,
+        extra_stats=None,
+    ):
+        seed_mask, seed_source = self._select_init_seed_mask(prior_mask, core_mask=core_mask, support_mask=support_mask)
+        if seed_mask is None:
+            return None
+        matches_used = matches[seed_mask]
+        seed_data = self._build_init_seed_data(imid1, imid2, T_c1w, pose, matches_used, camera1, camera2)
+        if seed_data["num_seed_points"] < 3:
+            return None
+        seed_tri_points = self._candidate_points3D_for_init(
+            T_c1w,
+            pose,
+            matches_used,
+            self.mpsfm_rec.images[imid1],
+            self.mpsfm_rec.images[imid2],
+            camera1,
+            camera2,
+        )
+        return {
+            "name": name,
+            "pose": pose,
+            "seed_mask": seed_mask,
+            "seed_source": seed_source,
+            "matches_used": matches_used,
+            "rescale": self._estimate_init_rescale(imid1, kps1, T_c1w, seed_tri_points),
+            "seed_data": seed_data,
+            "stats": extra_stats or {},
+        }
 
     def _merge_candidate_points(self, points_lifted, points_triangulated):
         candidate_points = {}
@@ -1268,59 +1679,128 @@ class MpsfmRegistration(BaseClass):
 
         if prior2 is not None:
             T_c2w = self.mpsfm_rec.align_prior_pose_to_current_world(prior2)
-            pts_tri_prior = self._candidate_points3D_for_init(
-                T_c1w, T_c2w, matches, self.mpsfm_rec.images[imid1], self.mpsfm_rec.images[imid2], camera1, camera2
-            )
-            rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_prior)
-            prior_inlier_mask = self._inlier_mask_for_pair_under_pose(
+            prior_inlier_mask = self._init_pair_prior_inlier_mask_from_pose(
                 imid1,
                 imid2,
                 T_c1w,
                 T_c2w,
-                camera1,
-                camera2,
                 matches,
                 kps1,
                 kps2,
-                log_stage="pre_refine",
+                camera1,
+                camera2,
             )
             self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
-            ap_min_num_inliers = self.conf.colmap_options.abs_pose_min_num_inliers
-            prior_inliers = int(prior_inlier_mask.sum())
-            fallback_thresh = max(3, ap_min_num_inliers // 2)
-            use_prior_only = prior_inliers >= fallback_thresh
-            matches_used = matches[prior_inlier_mask] if use_prior_only else matches
+            lookahead_imids = self._select_init_lookahead_images(imid1, imid2)
+
+            prior_hyp = self._make_init_hypothesis(
+                "prior",
+                T_c2w,
+                prior_inlier_mask,
+                matches,
+                imid1,
+                imid2,
+                T_c1w,
+                kps1,
+                camera1,
+                camera2,
+                extra_stats={
+                    "stage": "prior",
+                    "prior_inliers": int(np.count_nonzero(prior_inlier_mask)),
+                },
+            )
+            refined_hyps = []
 
             if self.conf.refine_init_prior_pose:
-                refine_matches = matches
-                T_c2w_refined, core_inlier_mask, support_inlier_mask, refined_ok, refine_stats = self._refine_init_pair_pose_bootstrap(
-                    imid1, imid2, T_c1w, T_c2w, refine_matches, kps1, kps2, camera1, camera2
+                refine_out = self._refine_init_pair_pose_bootstrap(
+                    imid1, imid2, T_c1w, T_c2w, matches, kps1, kps2, camera1, camera2
                 )
-                if refined_ok:
-                    T_c2w = T_c2w_refined
-                    joint_inlier_mask = prior_inlier_mask & support_inlier_mask
-                    selected_mask = None
-                    if int(np.count_nonzero(joint_inlier_mask)) >= 3:
-                        selected_mask = joint_inlier_mask
-                    elif prior_inliers >= 3:
-                        selected_mask = prior_inlier_mask
-                    self.mpsfm_rec.last_ap_inlier_masks = {
-                        imid1: selected_mask if selected_mask is not None else prior_inlier_mask
+                for hyp_name, hyp_key in (("rotation", "rotation"), ("refined", "full")):
+                    hyp_out = refine_out.get(hyp_key)
+                    if hyp_out is None:
+                        continue
+                    hyp = self._make_init_hypothesis(
+                        hyp_name,
+                        hyp_out["pose"],
+                        prior_inlier_mask,
+                        matches,
+                        imid1,
+                        imid2,
+                        T_c1w,
+                        kps1,
+                        camera1,
+                        camera2,
+                        core_mask=hyp_out["core_mask"],
+                        support_mask=hyp_out["support_mask"],
+                        extra_stats=hyp_out["stats"],
+                    )
+                    if hyp is not None:
+                        refined_hyps.append(hyp)
+
+            if prior_hyp is None and len(refined_hyps) == 0:
+                print(f"Init pair {imid1} and {imid2} has no valid high-confidence seed hypothesis")
+                return False
+
+            if prior_hyp is not None:
+                prior_hyp["lookahead"] = self._evaluate_init_hypothesis_lookahead(
+                    imid1,
+                    imid2,
+                    prior_hyp["seed_data"],
+                    lookahead_imids,
+                )
+            for hyp in refined_hyps:
+                hyp["lookahead"] = self._evaluate_init_hypothesis_lookahead(
+                    imid1,
+                    imid2,
+                    hyp["seed_data"],
+                    lookahead_imids,
+                )
+
+            def _hyp_rank_key(hyp):
+                look = hyp["lookahead"]
+                return (
+                    look["num_registerable"],
+                    look["median_inliers"],
+                    look["median_inlier_ratio"],
+                    look["score"],
+                    hyp["seed_data"]["num_seed_points"],
+                )
+
+            selected_hyp = prior_hyp
+            if refined_hyps:
+                best_refined_hyp = max(refined_hyps, key=_hyp_rank_key)
+                if selected_hyp is None or self._is_refined_init_hypothesis_better(
+                    best_refined_hyp["lookahead"],
+                    selected_hyp["lookahead"],
+                ):
+                    selected_hyp = best_refined_hyp
+
+            self.mpsfm_rec.last_init_hypothesis_selection = {
+                "lookahead_imids": [int(imid) for imid in lookahead_imids],
+                "selected_name": selected_hyp["name"],
+                "prior": None
+                if prior_hyp is None
+                else {
+                    "seed_source": prior_hyp["seed_source"],
+                    "seed_points": int(prior_hyp["seed_data"]["num_seed_points"]),
+                    "lookahead": prior_hyp["lookahead"],
+                    "stats": prior_hyp["stats"],
+                },
+                "refined": [
+                    {
+                        "name": hyp["name"],
+                        "seed_source": hyp["seed_source"],
+                        "seed_points": int(hyp["seed_data"]["num_seed_points"]),
+                        "lookahead": hyp["lookahead"],
+                        "stats": hyp["stats"],
                     }
-                    if selected_mask is not None:
-                        matches_used = matches[selected_mask]
-                        pts_tri_refined = self._candidate_points3D_for_init(
-                            T_c1w,
-                            T_c2w,
-                            matches_used,
-                            self.mpsfm_rec.images[imid1],
-                            self.mpsfm_rec.images[imid2],
-                            camera1,
-                            camera2,
-                        )
-                        rescale = self._estimate_init_rescale(imid1, kps1, T_c1w, pts_tri_refined)
-                else:
-                    self.mpsfm_rec.last_ap_inlier_masks = {imid1: prior_inlier_mask}
+                    for hyp in refined_hyps
+                ],
+            }
+            T_c2w = selected_hyp["pose"]
+            matches_used = selected_hyp["matches_used"]
+            rescale = selected_hyp["rescale"]
+            self.mpsfm_rec.last_ap_inlier_masks = {imid1: selected_hyp["seed_mask"]}
         else:
             unproj_cam0, valid_lifted0 = self._lift_points_for_init(imid1, kps1, camera1)
             valid_matches0 = matches[valid_lifted0[matches[:, 0]]]
